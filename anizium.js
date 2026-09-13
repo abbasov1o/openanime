@@ -171,7 +171,7 @@ function extractStreamUrl(episodeUrl) {
         var subtitle = "";
         var subs = j.subtitles || [];
         for (var t = 0; t < subs.length; t++) {
-            if (subs[t].link && subs[t].name && subs[t].name.toLowerCase().indexOf("türk") !== -1) {
+            if (subs[t].link && subs[t].group === "tr") {
                 subtitle = subs[t].link;
                 break;
             }
