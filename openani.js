@@ -39,25 +39,25 @@ function loadFullAnimeList() {
     if (HOME_ANIMES) return Promise.resolve(HOME_ANIMES);
     return fetchHTML("https://openani.me/__data.json").then(function(text) {
         var data = JSON.parse(text);
-        var nodes = data.nodes;
-        var root = nodes[0].data[0];
-        var animesNode = nodes[root.animes];
-        if (!animesNode || !animesNode.length) throw new Error("No animes in data");
+        var flat = data.nodes[0].data;
+        var root = flat[0];
+        var animeRefs = flat[root.popularAnimes] || flat[root.animes];
+        if (!animeRefs || !animeRefs.length) throw new Error("No animes in data");
         var result = [];
-        for (var i = 0; i < animesNode.length; i++) {
-            var ref = animesNode[i];
-            var anime = nodes[ref];
+        for (var i = 0; i < animeRefs.length; i++) {
+            var ref = animeRefs[i];
+            var anime = flat[ref];
             if (!anime || typeof anime !== "object") continue;
-            var slug = resolveRef(nodes, anime.slug);
+            var slug = resolveRef(flat, anime.slug);
             if (!slug || typeof slug !== "string") continue;
-            var title = resolveRef(nodes, anime.turkish);
+            var title = resolveRef(flat, anime.turkish);
             var avatar = "";
             if (anime.pictures !== undefined && typeof anime.pictures === "number" && anime.pictures >= 0) {
-                var pics = nodes[anime.pictures];
+                var pics = flat[anime.pictures];
                 if (pics && typeof pics === "object") {
-                    var poster = resolveRef(nodes, pics.poster);
-                    var banner = resolveRef(nodes, pics.banner);
-                    var av = resolveRef(nodes, pics.avatar);
+                    var poster = resolveRef(flat, pics.poster);
+                    var banner = resolveRef(flat, pics.banner);
+                    var av = resolveRef(flat, pics.avatar);
                     avatar = (typeof poster === "string" ? poster : "") || (typeof av === "string" ? av : "") || (typeof banner === "string" ? banner : "");
                 }
             }
@@ -67,7 +67,7 @@ function loadFullAnimeList() {
         }
         var cdnHostRef = root.random_cdn_host;
         if (typeof cdnHostRef === "number" && cdnHostRef >= 0) {
-            CACHE.cdnHost = nodes[cdnHostRef];
+            CACHE.cdnHost = flat[cdnHostRef];
         }
         HOME_ANIMES = result;
         return result;
