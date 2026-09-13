@@ -41,15 +41,21 @@ function loadFullAnimeList() {
         var data = JSON.parse(text);
         var flat = data.nodes[0].data;
         var root = flat[0];
-        var animeRefs = flat[root.popularAnimes] || flat[root.animes];
-        if (!animeRefs || !animeRefs.length) throw new Error("No animes in data");
+        var animeRefs = [];
+        var primary = flat[root.popularAnimes];
+        var secondary = flat[root.animes];
+        if (primary && primary.length) animeRefs = animeRefs.concat(primary);
+        if (secondary && secondary.length) animeRefs = animeRefs.concat(secondary);
+        if (!animeRefs.length) throw new Error("No animes in data");
         var result = [];
+        var seen = {};
         for (var i = 0; i < animeRefs.length; i++) {
             var ref = animeRefs[i];
             var anime = flat[ref];
             if (!anime || typeof anime !== "object") continue;
             var slug = resolveRef(flat, anime.slug);
-            if (!slug || typeof slug !== "string") continue;
+            if (!slug || typeof slug !== "string" || seen[slug]) continue;
+            seen[slug] = true;
             var title = resolveRef(flat, anime.turkish);
             var avatar = "";
             if (anime.pictures !== undefined && typeof anime.pictures === "number" && anime.pictures >= 0) {
@@ -113,7 +119,35 @@ function loadHomeAnimes() {
     });
 }
 
-function searchResults(keyword) {
+function apiSearch(keyword, page) {
+    var apiUrl = "https://api.openani.me/anime?page=" + (page || 1) +
+        "&keywords=" + encodeURIComponent(keyword || "") + "&score=&date=";
+    return Promise.resolve(fetchv2(apiUrl)).then(function(resp) {
+        if (!resp.ok) throw new Error("API HTTP " + resp.status);
+        return resp.json();
+    }).then(function(data) {
+        var list = (data && data.animes) || [];
+        var items = [];
+        for (var i = 0; i < list.length; i++) {
+            var a = list[i];
+            if (!a || !a.slug) continue;
+            var title = a.turkish || a.english || a.romaji || a.slug;
+            var image = "";
+            if (a.pictures) {
+                image = a.pictures.avatar || a.pictures.banner || a.pictures.poster || "";
+            }
+            if (!image) continue;
+            items.push({
+                title: title,
+                image: image,
+                href: "https://openani.me/anime/" + a.slug
+            });
+        }
+        return items;
+    });
+}
+
+function localSearch(keyword) {
     return loadFullAnimeList().then(function(animes) {
         var q = (keyword || "").toString().toLowerCase().trim();
         var results = q ? [] : animes;
@@ -128,8 +162,25 @@ function searchResults(keyword) {
         var items = [];
         for (var i = 0; i < results.length; i++) {
             var r = results[i];
-            items.push({ title: r.title || r.slug, image: r.avatar || "", href: r.slug });
+            items.push({ title: r.title || r.slug, image: r.avatar || "", href: "https://openani.me/anime/" + r.slug });
         }
+        return items;
+    });
+}
+
+function searchResults(keyword) {
+    var kw = (keyword || "").toString().trim();
+    if (!kw) {
+        return apiSearch("", 1).catch(function() { return localSearch(""); }).then(function(items) {
+            return JSON.stringify(items);
+        }).catch(function() { return JSON.stringify([]); });
+    }
+    return apiSearch(kw, 1).then(function(items) {
+        if (items && items.length > 0) return items;
+        return localSearch(kw);
+    }).catch(function() {
+        return localSearch(kw);
+    }).then(function(items) {
         return JSON.stringify(items);
     }).catch(function() { return JSON.stringify([]); });
 }
