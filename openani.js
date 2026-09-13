@@ -9,55 +9,6 @@ function fetchHTML(url) {
     });
 }
 
-function balancedExtract(html, startMarker) {
-    var pos = html.indexOf(startMarker);
-    if (pos === -1) return null;
-    pos += startMarker.length;
-    var depth = 0, start = -1, end = -1;
-    for (var i = pos; i < html.length; i++) {
-        if (html[i] === '[' || html[i] === '{') {
-            if (depth === 0) start = i;
-            depth++;
-        } else if (html[i] === ']' || html[i] === '}') {
-            depth--;
-            if (depth === 0) { end = i + 1; break; }
-        }
-    }
-    if (start === -1 || end === -1) return null;
-    var str = html.substring(start, end).replace(/void 0/g, "null");
-    try { return JSON.parse(str); } catch (e) { return null; }
-}
-
-function loadHomeAnimes() {
-    if (HOME_ANIMES) return Promise.resolve(HOME_ANIMES);
-    return fetchHTML("https://openani.me").then(function(html) {
-        var dataArray = balancedExtract(html, "const data = ");
-        var animes = [];
-        if (dataArray && dataArray[0] && dataArray[0].data) {
-            if (dataArray[0].data.animes) animes = animes.concat(dataArray[0].data.animes);
-            if (dataArray[0].data.popularAnimes) animes = animes.concat(dataArray[0].data.popularAnimes);
-            if (dataArray[0].data.random_cdn_host) CACHE.cdnHost = dataArray[0].data.random_cdn_host;
-        }
-        var seen = {}, unique = [];
-        for (var i = 0; i < animes.length; i++) {
-            var a = animes[i], key = a.slug || a._id || a.id || "";
-            if (!seen[key]) { seen[key] = true; unique.push(a); }
-        }
-        HOME_ANIMES = unique;
-        return unique;
-    });
-}
-
-function getDisplayTitle(a) {
-    return a.turkish || a.romaji || a.english || "";
-}
-
-function getImage(a) {
-    if (a.pictures && a.pictures.avatar) return a.pictures.avatar;
-    if (a.avatar) return a.avatar;
-    return "";
-}
-
 function parseSlug(url) {
     if (url.indexOf("openani.me/anime/") !== -1) {
         var parts = url.split("/anime/");
@@ -75,27 +26,109 @@ function parseSeasonEpisode(url) {
     return { season: 1, episode: 1 };
 }
 
+function resolveRef(nodes, ref) {
+    if (typeof ref === "number" && ref >= 0 && ref < nodes.length) {
+        var val = nodes[ref];
+        if (typeof val === "string") return val;
+        if (typeof val === "number" && val >= 0 && val < nodes.length) return nodes[val];
+    }
+    return ref;
+}
+
+function loadFullAnimeList() {
+    if (HOME_ANIMES) return Promise.resolve(HOME_ANIMES);
+    return fetchHTML("https://openani.me/__data.json").then(function(text) {
+        var data = JSON.parse(text);
+        var nodes = data.nodes;
+        var root = nodes[0].data[0];
+        var animesNode = nodes[root.animes];
+        if (!animesNode || !animesNode.length) throw new Error("No animes in data");
+        var result = [];
+        for (var i = 0; i < animesNode.length; i++) {
+            var ref = animesNode[i];
+            var anime = nodes[ref];
+            if (!anime || typeof anime !== "object") continue;
+            var slug = resolveRef(nodes, anime.slug);
+            if (!slug || typeof slug !== "string") continue;
+            var title = resolveRef(nodes, anime.turkish);
+            var avatar = "";
+            if (anime.pictures !== undefined && typeof anime.pictures === "number" && anime.pictures >= 0) {
+                var pics = nodes[anime.pictures];
+                if (pics && typeof pics === "object") {
+                    var poster = resolveRef(nodes, pics.poster);
+                    var banner = resolveRef(nodes, pics.banner);
+                    var av = resolveRef(nodes, pics.avatar);
+                    avatar = (typeof poster === "string" ? poster : "") || (typeof av === "string" ? av : "") || (typeof banner === "string" ? banner : "");
+                }
+            }
+            if (typeof title !== "string") title = slug;
+            if (typeof avatar !== "string") avatar = "";
+            result.push({ slug: slug, title: title, avatar: avatar });
+        }
+        var cdnHostRef = root.random_cdn_host;
+        if (typeof cdnHostRef === "number" && cdnHostRef >= 0) {
+            CACHE.cdnHost = nodes[cdnHostRef];
+        }
+        HOME_ANIMES = result;
+        return result;
+    }).catch(function() {
+        return loadHomeAnimes();
+    });
+}
+
+function loadHomeAnimes() {
+    if (HOME_ANIMES) return Promise.resolve(HOME_ANIMES);
+    return fetchHTML("https://openani.me").then(function(html) {
+        var result = [];
+        var slugRegex = /slug:"([^"]+)"/g;
+        var slugMatch;
+        var slugs = [];
+        while ((slugMatch = slugRegex.exec(html)) !== null) {
+            var s = slugMatch[1];
+            if (s && slugs.indexOf(s) === -1) slugs.push(s);
+        }
+        var turkishRegex = /turkish:"([^"]*)"/g;
+        var turkishMatch;
+        var turkishList = [];
+        while ((turkishMatch = turkishRegex.exec(html)) !== null) {
+            turkishList.push(turkishMatch[1] || "");
+        }
+        var avatarRegex = /avatar:"(https:\/\/image\.tmdb\.org\/[^"]+)"/g;
+        var avatarMatch;
+        var avatarList = [];
+        while ((avatarMatch = avatarRegex.exec(html)) !== null) {
+            avatarList.push(avatarMatch[1]);
+        }
+        for (var i = 0; i < slugs.length; i++) {
+            result.push({
+                slug: slugs[i],
+                title: turkishList[i] || slugs[i],
+                avatar: avatarList[i] || ""
+            });
+        }
+        var cdnMatch = /random_cdn_host:"([^"]+)"/.exec(html);
+        if (cdnMatch) CACHE.cdnHost = cdnMatch[1];
+        HOME_ANIMES = result;
+        return result;
+    });
+}
+
 function searchResults(keyword) {
-    return loadHomeAnimes().then(function(animes) {
+    return loadFullAnimeList().then(function(animes) {
         var q = (keyword || "").toString().toLowerCase().trim();
         var results = q ? [] : animes;
         if (q) {
             for (var i = 0; i < animes.length; i++) {
                 var a = animes[i];
-                var title = (a.turkish || a.romaji || a.english || "").toLowerCase();
+                var t = (a.title || a.slug || "").toLowerCase();
                 var s = (a.slug || "").toLowerCase();
-                var orig = (a.originalName || "").toLowerCase();
-                var jp = (a.japanese || "").toLowerCase();
-                if (title.indexOf(q) !== -1 || s.indexOf(q) !== -1 || orig.indexOf(q) !== -1 || jp.indexOf(q) !== -1) {
-                    results.push(a);
-                }
+                if (t.indexOf(q) !== -1 || s.indexOf(q) !== -1) results.push(a);
             }
         }
         var items = [];
         for (var i = 0; i < results.length; i++) {
-            var a = results[i], s = a.slug || "";
-            if (!s) continue;
-            items.push({ title: getDisplayTitle(a), image: getImage(a), href: s });
+            var r = results[i];
+            items.push({ title: r.title || r.slug, image: r.avatar || "", href: r.slug });
         }
         return JSON.stringify(items);
     }).catch(function() { return JSON.stringify([]); });
@@ -117,11 +150,10 @@ function extractDetails(url) {
             return loadHomeAnimes().then(function(animes) {
                 for (var i = 0; i < animes.length; i++) {
                     if (animes[i].slug === slug) {
-                        var a = animes[i];
                         return JSON.stringify([{
-                            description: a.summary || "",
-                            aliases: [a.romaji, a.english, a.japanese].filter(Boolean).join(", "),
-                            airdate: a.firstAirDate || ""
+                            description: "",
+                            aliases: "",
+                            airdate: ""
                         }]);
                     }
                 }
@@ -169,10 +201,7 @@ function extractEpisodes(url) {
     return fetchHTML("https://openani.me/anime/" + slug).then(function(html) {
         var m = html.match(/<script\s+type="application\/json"[^>]*data-url="https:\/\/api\.openani\.me\/anime\/[^"]*"[^>]*>([\s\S]*?)<\/script>/);
         if (!m) {
-            return loadHomeAnimes().then(function(animes) {
-                for (var i = 0; i < animes.length; i++) {
-                    if (animes[i].slug === slug) return JSON.stringify(buildEpisodes(animes[i]));
-                }
+            return loadHomeAnimes().then(function() {
                 return JSON.stringify([]);
             });
         }
@@ -190,45 +219,56 @@ function extractStreamUrl(episodeUrl) {
     var epNum = se.episode;
     var pageUrl = "https://openani.me/anime/" + slug + "/" + seasonNum + "/" + epNum;
     return fetchHTML(pageUrl).then(function(html) {
-        var dataArray = balancedExtract(html, "const data = ");
-        if (!dataArray || dataArray.length < 2) return JSON.stringify({ streams: [], subtitle: "" });
-        var d = dataArray[1];
-        if (!d || !d.data || !d.data.requestResponse) return JSON.stringify({ streams: [], subtitle: "" });
-        var rr = d.data.requestResponse;
-        var cdnBase = rr.CDN_LINK || rr.DOWNLOAD_LINK || "";
-        if (!cdnBase) return JSON.stringify({ streams: [], subtitle: "" });
-        cdnBase = cdnBase.replace(/\/+$/, "");
-        var files = (rr.episodeData && rr.episodeData.files) ? rr.episodeData.files : [];
-        var fansubs = (rr.episodeData && rr.episodeData.fansubs) ? rr.episodeData.fansubs : [];
+        var cdnMatch = /CDN_LINK:"([^"]+)"/.exec(html);
+        if (!cdnMatch) return JSON.stringify({ streams: [], subtitle: "" });
+        var cdnBase = cdnMatch[1].replace(/\/+$/, "");
+        var filesRegex = /files:\[([^\]]+)\]/g;
+        var fm = filesRegex.exec(html);
+        var files = [];
+        if (fm) {
+            var fileMatch = /file:"([^"]+)"/g;
+            var resMatch = /resolution:(\d+)/g;
+            var fms, rms;
+            while ((fms = fileMatch.exec(fm[1])) !== null && (rms = resMatch.exec(fm[1])) !== null) {
+                files.push({ file: fms[1], resolution: parseInt(rms[1], 10) });
+            }
+        }
+        if (files.length === 0) {
+            var fSingle = /file:"([^"]+)"/.exec(html);
+            var rSingle = /resolution:(\d+)/.exec(html);
+            if (fSingle) {
+                files.push({ file: fSingle[1], resolution: rSingle ? parseInt(rSingle[1], 10) : 720 });
+            }
+        }
+        var fansubsRegex = /fansubs:\[([\s\S]*?)\],"/;
+        var fansubMatch = fansubsRegex.exec(html);
+        var fansubs = [];
+        if (fansubMatch) {
+            var fnRegex = /name:"([^"]+)"/g;
+            var fiRegex = /id:"(\d+)"/g;
+            var fnm, fim;
+            while ((fnm = fnRegex.exec(fansubMatch[1])) !== null && (fim = fiRegex.exec(fansubMatch[1])) !== null) {
+                fansubs.push({ name: fnm[1], id: fim[1] });
+            }
+        }
         var streams = [];
         for (var i = 0; i < files.length; i++) {
             var f = files[i];
-            var res = f.resolution || "720";
-            var fanName = "";
+            var title = f.resolution + "p";
             for (var j = 0; j < fansubs.length; j++) {
                 if (fansubs[j].id && f.file.indexOf(fansubs[j].id) !== -1) {
-                    fanName = fansubs[j].name;
+                    title = fansubs[j].name + " - " + title;
                     break;
                 }
             }
-            var title = res + "p";
-            if (fanName) title = fanName + " - " + title;
             var url = cdnBase + "/" + slug + "/" + seasonNum + "/" + f.file + "?big=1";
             streams.push({ streamUrl: url, title: title, headers: {} });
         }
         if (streams.length === 0) {
-            streams.push({
-                streamUrl: pageUrl,
-                title: "OpenAnime",
-                headers: {}
-            });
+            streams.push({ streamUrl: pageUrl, title: "OpenAnime", headers: {} });
         }
-        var sub = "";
-        if (rr.episodeData && rr.episodeData.fansub) {
-            sub = rr.episodeData.fansub.website || rr.episodeData.fansub.name || "";
-        }
-        return JSON.stringify({ streams: streams, subtitle: sub });
-    }).catch(function(e) {
+        return JSON.stringify({ streams: streams, subtitle: "" });
+    }).catch(function() {
         return JSON.stringify({ streams: [], subtitle: "" });
     });
 }
