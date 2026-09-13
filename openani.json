@@ -1,0 +1,18 @@
+{
+    "sourceName": "OpenAnime",
+    "iconUrl": "https://openani.me/favicon512.png",
+    "author": {
+        "name": "Ademi",
+        "url": "https://ademi.ai"
+    },
+    "version": "1.0.0",
+    "baseUrl": "https://openani.me",
+    "searchBaseUrl": "https://openani.me",
+    "scriptUrl": "https://raw.githubusercontent.com/abbasov1o/openanime/main/openani.js",
+    "type": "anime/shows/movies",
+    "asyncJS": true,
+    "streamType": "mp4",
+    "quality": "720p",
+    "language": "tr",
+    "softsub": true
+}
