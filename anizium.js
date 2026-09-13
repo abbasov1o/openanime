@@ -65,41 +65,101 @@ function loadAnime(id) {
     });
 }
 
-function searchResults(keyword) {
-    var kw = (keyword || "").toString().trim();
-    var urls;
-    if (kw) {
-        urls = [
-            API_HOST + "/page/search?value=" + encodeURIComponent(kw) + "&page=1",
-            API_HOST + "/page/search?value=" + encodeURIComponent(kw) + "&page=2"
-        ];
-    } else {
-        urls = [
-            API_HOST + "/page/top?platform=favorite&page=1",
-            API_HOST + "/page/top?platform=favorite&page=2",
-            API_HOST + "/page/top?platform=favorite&page=3"
-        ];
+function buildQueryCandidates(kw) {
+    var list = [];
+    function add(q) {
+        q = (q || "").replace(/\s+/g, " ").trim();
+        if (q && list.indexOf(q) === -1) list.push(q);
     }
+    add(kw);
+    if (!kw) return list;
+    var noise = new RegExp("\\b(season|sezon|b[o\\u00f6]l[u\\u00fc]m|bolum|episode|izle|watch|t[u\\u00fc]rk[c\\u00e7]e|dublaj|altyaz|hd|4k|1080p|720p|online|full|anime)\\b", "gi");
+    var cleaned = kw.replace(noise, " ").replace(/\s+/g, " ").trim();
+    add(cleaned);
+    var noDigits = cleaned.replace(/\s+\d+([._]?\d+)?\s*$/, "").trim();
+    add(noDigits);
+    var words = cleaned.split(" ");
+    while (words.length > 2 && list.length < 6) {
+        words.pop();
+        add(words.join(" "));
+    }
+    return list;
+}
+
+function fetchSearchItems(query) {
+    var urls = [
+        API_HOST + "/page/search?value=" + encodeURIComponent(query) + "&page=1",
+        API_HOST + "/page/search?value=" + encodeURIComponent(query) + "&page=2"
+    ];
     return Promise.all(urls.map(function(u) {
         return apiGet(u).catch(function() { return null; });
     })).then(function(results) {
         var items = [];
-        var seen = {};
         for (var r = 0; r < results.length; r++) {
             var j = results[r];
             if (!j || !j.success || !j.page || !j.page.data) continue;
             var list = j.page.data;
             for (var i = 0; i < list.length; i++) {
-                var a = list[i];
+                if (list[i]) items.push(list[i]);
+            }
+        }
+        return items;
+    });
+}
+
+function searchResults(keyword) {
+    var kw = (keyword || "").toString().replace(/\s+/g, " ").trim();
+    if (!kw) {
+        var topUrls = [
+            API_HOST + "/page/top?platform=favorite&page=1",
+            API_HOST + "/page/top?platform=favorite&page=2",
+            API_HOST + "/page/top?platform=favorite&page=3"
+        ];
+        return Promise.all(topUrls.map(function(u) {
+            return apiGet(u).catch(function() { return null; });
+        })).then(function(results) {
+            var items = [];
+            var seen = {};
+            for (var r = 0; r < results.length; r++) {
+                var j = results[r];
+                if (!j || !j.success || !j.page || !j.page.data) continue;
+                var list = j.page.data;
+                for (var i = 0; i < list.length; i++) {
+                    var a = list[i];
+                    if (!a || !a.ID || seen[a.ID]) continue;
+                    seen[a.ID] = true;
+                    items.push({
+                        title: a.name || a.ID,
+                        image: a.poster || a.banner || "",
+                        href: "https://anizium.co/anime/" + a.ID
+                    });
+                }
+            }
+            return JSON.stringify(items);
+        }).catch(function() { return JSON.stringify([]); });
+    }
+    var candidates = buildQueryCandidates(kw);
+    var all = [];
+    var seen = {};
+    function tryNext(i) {
+        if (i >= candidates.length || all.length >= 20) return Promise.resolve(all);
+        return fetchSearchItems(candidates[i]).then(function(items) {
+            for (var k = 0; k < items.length; k++) {
+                var a = items[k];
                 if (!a || !a.ID || seen[a.ID]) continue;
                 seen[a.ID] = true;
-                items.push({
+                all.push({
                     title: a.name || a.ID,
                     image: a.poster || a.banner || "",
                     href: "https://anizium.co/anime/" + a.ID
                 });
             }
-        }
+            return tryNext(i + 1);
+        }).catch(function() {
+            return tryNext(i + 1);
+        });
+    }
+    return tryNext(0).then(function(items) {
         return JSON.stringify(items);
     }).catch(function() { return JSON.stringify([]); });
 }
