@@ -1,3 +1,4 @@
+# Builds an unsigned IPA for every push to main.
 workflows:
   shirox-ios-ipa:
     name: Shirox iOS (unsigned IPA)
