@@ -28,6 +28,8 @@ struct LibraryWriteSink: PendingWriteSink {
             }
         case (.local, _):
             break   // local source is never queued
+        case (.anizium, _):
+            break   // Anizium has no cloud library in this build
         }
     }
 }

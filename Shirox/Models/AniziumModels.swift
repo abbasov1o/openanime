@@ -241,7 +241,7 @@ struct AniziumCalendarEntry: Decodable {
 
 // MARK: - Account
 
-struct AniziumUser: Decodable {
+struct AniziumUser: Codable {
     let ID: String
     let nick: String?
     let email: String?
@@ -253,7 +253,7 @@ struct AniziumUser: Decodable {
     let profiles: [AniziumProfile]?
 }
 
-struct AniziumProfile: Decodable, Identifiable {
+struct AniziumProfile: Codable, Identifiable {
     let ID: String
     let name: String?
     let avatarLink: String?
@@ -263,7 +263,7 @@ struct AniziumProfile: Decodable, Identifiable {
         case avatarLink = "avatar_link"
     }
 
-    var id: String { ID }
+    var id: String { self.ID }
 }
 
 struct AniziumUserEnvelope: Decodable {

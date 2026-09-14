@@ -36,10 +36,10 @@ final class AniziumProvider: MediaProvider {
     /// page (hero + curated rows), its favorite ranking for the popular row,
     /// and its most recently added episodes for the "Son Eklenen Bölümler" row.
     func homeFeed() async throws -> HomeFeed {
-        async let home = AniziumService.shared.home()
+        async let homeEnvelope = AniziumService.shared.home()
         async let popularPage = AniziumService.shared.top(page: 1)
         async let latest = AniziumService.shared.lastAddedEpisodes(page: 1)
-        let (home, popular, latestEpisodes) = try await (home, popularPage, latest)
+        let (home, popular, latestEpisodes) = try await (homeEnvelope, popularPage, latest)
 
         let featured = featuredShows(from: home)
         return HomeFeed(

@@ -224,8 +224,8 @@ final class ModuleManager: ObservableObject {
     private func ensureEmbeddedModulesPresent() {
         guard let embedded = AniziumEmbeddedModule.makeDefinition() else { return }
         if let index = modules.firstIndex(where: { $0.id == embedded.id }) {
-            if modules[index].scriptContent != embedded.script {
-                modules[index].scriptContent = embedded.script
+            if modules[index].scriptContent != AniziumEmbeddedModule.script {
+                modules[index].scriptContent = AniziumEmbeddedModule.script
                 saveToStorage()
             }
             return

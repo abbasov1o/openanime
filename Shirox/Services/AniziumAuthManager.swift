@@ -40,14 +40,14 @@ final class AniziumAuthManager: ObservableObject {
 
     /// Keychain reads are safe from any isolation context, so the HTTP layer can
     /// pick the session headers up without hopping to the main actor.
-    private static let keychainService = "com.shirox.app.anizium"
-    private static let sessionAccount = "anizium_user_session"
-    private static let profileAccount = "anizium_profile_id"
+    nonisolated private static let keychainService = "com.shirox.app.anizium"
+    nonisolated private static let sessionAccount = "anizium_user_session"
+    nonisolated private static let profileAccount = "anizium_profile_id"
 
     nonisolated var sessionToken: String? { AniziumAuthManager.readToken() }
     nonisolated var storedProfileID: String? { AniziumAuthManager.readProfileID() }
 
-    private static func keychainRead(account: String) -> String? {
+    nonisolated private static func keychainRead(account: String) -> String? {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -61,7 +61,7 @@ final class AniziumAuthManager: ObservableObject {
         return String(data: data, encoding: .utf8)
     }
 
-    private static func keychainWrite(account: String, value: String) {
+    nonisolated private static func keychainWrite(account: String, value: String) {
         keychainDelete(account: account)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -73,7 +73,7 @@ final class AniziumAuthManager: ObservableObject {
         SecItemAdd(query as CFDictionary, nil)
     }
 
-    private static func keychainDelete(account: String) {
+    nonisolated private static func keychainDelete(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: keychainService,
@@ -82,8 +82,8 @@ final class AniziumAuthManager: ObservableObject {
         SecItemDelete(query as CFDictionary)
     }
 
-    private static func readToken() -> String? { keychainRead(account: sessionAccount) }
-    private static func readProfileID() -> String? { keychainRead(account: profileAccount) }
+    nonisolated private static func readToken() -> String? { keychainRead(account: sessionAccount) }
+    nonisolated private static func readProfileID() -> String? { keychainRead(account: profileAccount) }
 
     // MARK: - Sign in / register
 

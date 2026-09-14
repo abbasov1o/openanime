@@ -87,7 +87,7 @@ final class AniziumService {
     /// grouped by day.
     func calendar() async throws -> [AniziumCalendarDay] {
         let envelope = try await AniziumClient.get(
-            AniziumEnvelope<AniziumCalendarDay>.self,
+            AniziumEnvelope<[AniziumCalendarDay]>.self,
             path: "/page/calendar",
             session: .anonymous
         )
@@ -107,7 +107,7 @@ final class AniziumService {
     }
 
     func saveKeepWatching(id: String, season: Int, episode: Int, time: Double) async throws {
-        try await AniziumClient.request(
+        _ = try await AniziumClient.request(
             path: "/anime/keep-watching/save",
             method: "POST",
             body: ["id": id, "season": season, "episode": episode, "time": Int(time)],
@@ -117,7 +117,7 @@ final class AniziumService {
     }
 
     func deleteKeepWatching(id: String, season: Int, episode: Int) async throws {
-        try await AniziumClient.request(
+        _ = try await AniziumClient.request(
             path: "/anime/keep-watching/delete",
             method: "POST",
             body: ["id": id, "season": season, "episode": episode],
@@ -137,7 +137,7 @@ final class AniziumService {
     }
 
     func markNotificationRead(id: String) async throws {
-        try await AniziumClient.request(
+        _ = try await AniziumClient.request(
             path: "/user/notification/read",
             method: "POST",
             body: ["id": id],

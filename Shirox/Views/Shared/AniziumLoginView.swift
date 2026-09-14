@@ -56,7 +56,7 @@ struct AniziumLoginView: View {
         List {
             Section {
                 HStack(spacing: 12) {
-                    CachedAsyncImage(urlString: selectedAvatarURL)
+                    CachedAsyncImage(urlString: selectedAvatarURL ?? "")
                         .frame(width: 44, height: 44)
                         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     VStack(alignment: .leading, spacing: 2) {
@@ -76,7 +76,7 @@ struct AniziumLoginView: View {
                             auth.selectProfile(profile.ID)
                         } label: {
                             HStack {
-                                CachedAsyncImage(urlString: profile.avatarLink)
+                                CachedAsyncImage(urlString: profile.avatarLink ?? "")
                                     .frame(width: 28, height: 28)
                                     .clipShape(RoundedRectangle(cornerRadius: 6))
                                 Text(profile.name ?? profile.ID)
