@@ -8,21 +8,23 @@ enum AniziumEmbeddedModule {
     /// Stable identity for the embedded module (`ModuleDefinition.id` is its scriptUrl).
     static let scriptURL = "https://anizium.co/modules/anizium.js"
 
-    static let manifestJSON = #"{
-        "sourceName": "Anizium",
-        "iconUrl": "https://anizium.co/assets/images/favicon.png",
-        "author": {"name": "Ademi", "url": "https://ademi.ai"},
-        "version": "1.1.0",
-        "baseUrl": "https://anizium.co",
-        "searchBaseUrl": "https://anizium.co",
-        "scriptUrl": "https://anizium.co/modules/anizium.js",
-        "type": "anime/shows/movies",
-        "asyncJS": true,
-        "streamType": "mp4",
-        "quality": "4K",
-        "language": "tr",
-        "softsub": true
-    }"#
+    static let manifestJSON = #"""
+        {
+            "sourceName": "Anizium",
+            "iconUrl": "https://anizium.co/assets/images/favicon.png",
+            "author": {"name": "Ademi", "url": "https://ademi.ai"},
+            "version": "1.1.0",
+            "baseUrl": "https://anizium.co",
+            "searchBaseUrl": "https://anizium.co",
+            "scriptUrl": "https://anizium.co/modules/anizium.js",
+            "type": "anime/shows/movies",
+            "asyncJS": true,
+            "streamType": "mp4",
+            "quality": "4K",
+            "language": "tr",
+            "softsub": true
+        }
+        """#
 
     /// The module script, byte-for-byte the anizium.js the previous session verified
     /// against the live API (Cf-Control token, search, episodes, MP4 streams, subtitles).
