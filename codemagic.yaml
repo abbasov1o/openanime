@@ -5,10 +5,6 @@ workflows:
     max_build_duration: 60
     environment:
       xcode: latest
-    cache:
-      cache_key_prefix: shirox-spm
-      cache_paths:
-        - ~/Library/Developer/Xcode/DerivedData/**/SourcePackages
     triggering:
       events:
         - push
