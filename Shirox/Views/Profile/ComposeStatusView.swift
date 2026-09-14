@@ -1,0 +1,52 @@
+import SwiftUI
+
+struct ComposeStatusView: View {
+    @ObservedObject var profileVM: ProfileViewModel
+    @Environment(\.dismiss) private var dismiss
+    @State private var text = ""
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 0) {
+                #if !os(tvOS)
+                TextEditor(text: $text)
+                    .frame(minHeight: 120)
+                    .padding()
+                #endif
+                Divider()
+                Text("\(text.count) / 2000")
+                    .font(.caption)
+                    .foregroundStyle(text.count > 2000 ? .red : .secondary)
+                    .padding(.horizontal)
+                    .padding(.top, 6)
+                Spacer()
+            }
+            .navigationTitle("New Status")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Post") {
+                        Task {
+                            await profileVM.postStatus(text: text)
+                            dismiss()
+                        }
+                    }
+                    .disabled(text.trimmingCharacters(in: .whitespaces).isEmpty || text.count > 2000 || profileVM.isLoadingActivity)
+                }
+            }
+        }
+        #if os(iOS)
+        .adaptivePresentationDetents([.medium, .large])
+
+        #else
+
+        .frame(minWidth: 480, minHeight: 360)
+
+        #endif
+    }
+}

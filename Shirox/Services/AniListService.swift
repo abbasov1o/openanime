@@ -1,0 +1,1475 @@
+import Foundation
+import Combine
+
+// MARK: - Response wrappers with error handling
+
+private struct GraphQLResponse<T: Decodable>: Decodable {
+    let data: T?
+    let errors: [GraphQLError]?
+}
+
+private struct GraphQLError: Decodable {
+    let message: String
+    let status: Int?
+}
+
+// MARK: - Page response structures
+
+private struct PageData: Decodable {
+    let Page: PageContent
+}
+
+private struct PageContent: Decodable {
+    let media: [AniListMedia]
+}
+
+// MARK: - Media Data Wrapper
+
+private struct MediaData: Decodable {
+    let Media: AniListMedia
+}
+
+// MARK: - Service
+
+final class AniListService {
+    nonisolated(unsafe) static let shared = AniListService()
+
+    private let endpoint = URL(string: "https://graphql.anilist.co")!
+    private let session: URLSession
+
+    private init() {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 15
+        config.httpAdditionalHeaders = [
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        ]
+        session = URLSession(configuration: config)
+    }
+
+    // MARK: - Public API
+
+    /// The raw per-row results behind `HomeFeed`, before `AniListProvider` maps them to `Media`.
+    struct HomeFeedRaw {
+        let trending: [AniListMedia]
+        let seasonal: [AniListMedia]
+        let lastSeason: [AniListMedia]
+        let popular: [AniListMedia]
+        let topRated: [AniListMedia]
+    }
+
+    /// Every Home row in one request, via GraphQL field aliasing, instead of the five separate
+    /// round trips this used to take — the single biggest thing this app could do to stop
+    /// tripping AniList's tightened rate limit, since Home fires this on every load and on
+    /// every provider switch.
+    ///
+    /// Tolerant of a partially-failed response: GraphQL can answer with `data` where some
+    /// aliased fields are populated and others null, alongside an `errors` array naming which
+    /// failed. Each row falls back to empty rather than the whole feed failing over one bad
+    /// row — matching how `lastSeasonCompleted()` was always allowed to come back empty. The
+    /// five separate calls this replaces were all-or-nothing, since one `async let` throwing
+    /// took the whole tuple with it.
+    func homeFeed() async throws -> HomeFeedRaw {
+        let (season, year) = AniListSeason.current()
+        let (pSeason, pYear) = AniListSeason.previous()
+        let perPage = DataSaver.rowLength(20)
+        let query = """
+        query ($season: MediaSeason, $year: Int, $pSeason: MediaSeason, $pYear: Int) {
+          trending: Page(page: 1, perPage: \(perPage)) {
+            media(type: ANIME, sort: TRENDING_DESC, isAdult: false) { ...MediaFields }
+          }
+          seasonal: Page(page: 1, perPage: \(perPage)) {
+            media(season: $season, seasonYear: $year, type: ANIME, sort: POPULARITY_DESC, isAdult: false) { ...MediaFields }
+          }
+          lastSeason: Page(page: 1, perPage: \(perPage)) {
+            media(season: $pSeason, seasonYear: $pYear, type: ANIME, status: FINISHED, sort: POPULARITY_DESC, isAdult: false) { ...MediaFields }
+          }
+          popular: Page(page: 1, perPage: \(perPage)) {
+            media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) { ...MediaFields }
+          }
+          topRated: Page(page: 1, perPage: \(perPage)) {
+            media(type: ANIME, sort: SCORE_DESC, isAdult: false) { ...MediaFields }
+          }
+        }
+        fragment MediaFields on Media {
+          id
+          title { romaji english native }
+          coverImage { large extraLarge }
+          bannerImage
+          averageScore
+          genres
+          description(asHtml: false)
+        }
+        """
+        let variables: [String: Any] = [
+            "season": season.rawValue, "year": year,
+            "pSeason": pSeason.rawValue, "pYear": pYear
+        ]
+        let data = try await post(query: query, variables: variables)
+
+        struct Response: Decodable {
+            struct Feed: Decodable {
+                let trending: PageContent?
+                let seasonal: PageContent?
+                let lastSeason: PageContent?
+                let popular: PageContent?
+                let topRated: PageContent?
+            }
+            let data: Feed?
+            let errors: [GraphQLError]?
+        }
+        let response = try JSONDecoder().decode(Response.self, from: data)
+        guard let feed = response.data else {
+            if let errors = response.errors {
+                if errors.contains(where: { $0.status == 403 }) { throw AniListError.httpError(403) }
+                throw AniListError.graphQL(errors.map(\.message).joined(separator: ", "))
+            }
+            throw AniListError.noData
+        }
+        return HomeFeedRaw(
+            trending: feed.trending?.media ?? [],
+            seasonal: feed.seasonal?.media ?? [],
+            lastSeason: feed.lastSeason?.media ?? [],
+            popular: feed.popular?.media ?? [],
+            topRated: feed.topRated?.media ?? []
+        )
+    }
+
+    func search(keyword: String) async throws -> [AniListMedia] {
+        let query = """
+        query ($search: String) {
+          Page(page: 1, perPage: \(DataSaver.rowLength(25))) {
+            media(search: $search, type: ANIME, sort: SEARCH_MATCH, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query, variables: ["search": keyword])
+    }
+
+    /// AniList MANGA search, used to auto-match a module-scraped manga to a
+    /// tracking entry. Selects `idMal` (→ MAL tracking for free) and `chapters`
+    /// (total, for Completed promotion; nil when ongoing).
+    func searchManga(keyword: String) async throws -> [AniListMedia] {
+        let query = """
+        query ($search: String) {
+          Page(page: 1, perPage: \(DataSaver.rowLength(25))) {
+            media(search: $search, type: MANGA, sort: SEARCH_MATCH, isAdult: false) {
+              id
+              idMal
+              title { romaji english native }
+              coverImage { large extraLarge }
+              chapters
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query, variables: ["search": keyword])
+    }
+
+    /// Normalized set of adult (`isAdult: true`) anime title variants + synonyms
+    /// matching `keyword`. Used by NSFWContentFilter to screen module results.
+    func searchAdultTitles(keyword: String) async throws -> Set<String> {
+        struct AdultPage: Decodable { let Page: AdultContent }
+        struct AdultContent: Decodable { let media: [AdultMedia] }
+        struct AdultMedia: Decodable {
+            let title: AniListTitle
+            let synonyms: [String]?
+        }
+        let query = """
+        query ($search: String) {
+          Page(page: 1, perPage: \(DataSaver.rowLength(25))) {
+            media(search: $search, type: ANIME, isAdult: true) {
+              title { romaji english native }
+              synonyms
+            }
+          }
+        }
+        """
+        let data = try await post(query: query, variables: ["search": keyword])
+        let response = try JSONDecoder().decode(GraphQLResponse<AdultPage>.self, from: data)
+        var result = Set<String>()
+        for media in response.data?.Page.media ?? [] {
+            let variants: [String?] = [media.title.romaji, media.title.english, media.title.native]
+                + (media.synonyms ?? []).map(Optional.some)
+            for raw in variants {
+                guard let raw, !raw.isEmpty else { continue }
+                let norm = NSFWContentFilter.normalize(raw)
+                if !norm.isEmpty { result.insert(norm) }
+            }
+        }
+        return result
+    }
+
+    func trending() async throws -> [AniListMedia] {
+        let query = """
+        query {
+          Page(page: 1, perPage: \(DataSaver.rowLength(20))) {
+            media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query)
+    }
+
+    /// One scheduled broadcast as AniList reports it, before mapping to the app's `Media`.
+    struct AniListAiringEntry {
+        let media: AniListMedia
+        let episode: Int
+        let airingAt: Date
+    }
+
+    /// Episodes airing between two instants, earliest first.
+    ///
+    /// AniList publishes an exact airing timestamp per episode, which is what makes a real
+    /// calendar possible rather than a list of weekdays.
+    func airingSchedule(from start: Date, to end: Date) async throws -> [AniListAiringEntry] {
+        let query = """
+        query ($start: Int, $end: Int) {
+          Page(page: 1, perPage: 50) {
+            airingSchedules(airingAt_greater: $start, airingAt_lesser: $end, sort: TIME) {
+              episode
+              airingAt
+              media {
+                id
+                idMal
+                title { romaji english native }
+                coverImage { large extraLarge }
+                bannerImage
+                episodes
+                status
+                averageScore
+                genres
+                description(asHtml: false)
+              }
+            }
+          }
+        }
+        """
+        let variables: [String: Any] = [
+            "start": Int(start.timeIntervalSince1970),
+            "end": Int(end.timeIntervalSince1970)
+        ]
+        let data = try await post(query: query, variables: variables)
+
+        struct Response: Decodable {
+            struct ResponseData: Decodable {
+                struct PageData: Decodable {
+                    let airingSchedules: [Schedule]
+                }
+                let Page: PageData
+            }
+            struct Schedule: Decodable {
+                let episode: Int
+                let airingAt: Int
+                let media: AniListMedia?
+            }
+            let data: ResponseData?
+        }
+
+        let decoded = try JSONDecoder().decode(Response.self, from: data)
+        return (decoded.data?.Page.airingSchedules ?? []).compactMap { entry in
+            guard let media = entry.media else { return nil }
+            return AniListAiringEntry(
+                media: media,
+                episode: entry.episode,
+                airingAt: Date(timeIntervalSince1970: TimeInterval(entry.airingAt))
+            )
+        }
+    }
+
+    /// Browsable anime for the Search tab, optionally narrowed to one genre.
+    ///
+    /// The tab used to show nothing at all until you typed, which meant no way in for anyone
+    /// who didn't already know what they were looking for.
+    func discover(genre: String?, sort: DiscoverSort, page: Int) async throws -> [AniListMedia] {
+        let genreFilter = genre == nil ? "" : ", genre_in: $genres"
+        let genreVar = genre == nil ? "" : ", $genres: [String]"
+        let query = """
+        query ($page: Int, $sort: [MediaSort]\(genreVar)) {
+          Page(page: $page, perPage: 30) {
+            media(type: ANIME, sort: $sort, isAdult: false\(genreFilter)) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        var variables: [String: Any] = ["page": page, "sort": [sort.aniListValue]]
+        if let genre { variables["genres"] = [genre] }
+        return try await fetchPage(query: query, variables: variables)
+    }
+
+    /// Last season's *finished* shows — the binge row. `status: FINISHED` is the whole point:
+    /// a cour that has stopped airing is watchable end to end, which is what makes it worth
+    /// surfacing separately from "This Season".
+    func lastSeasonCompleted() async throws -> [AniListMedia] {
+        let (season, year) = AniListSeason.previous()
+        let query = """
+        query ($season: MediaSeason, $year: Int) {
+          Page(page: 1, perPage: \(DataSaver.rowLength(20))) {
+            media(season: $season, seasonYear: $year, type: ANIME, status: FINISHED, sort: POPULARITY_DESC, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query, variables: ["season": season.rawValue, "year": year])
+    }
+
+    func seasonal() async throws -> [AniListMedia] {
+        let (season, year) = AniListSeason.current()
+        let query = """
+        query ($season: MediaSeason, $year: Int) {
+          Page(page: 1, perPage: \(DataSaver.rowLength(20))) {
+            media(season: $season, seasonYear: $year, type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query, variables: ["season": season.rawValue, "year": year])
+    }
+
+    func popular() async throws -> [AniListMedia] {
+        let query = """
+        query {
+          Page(page: 1, perPage: \(DataSaver.rowLength(20))) {
+            media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query)
+    }
+
+    func topRated() async throws -> [AniListMedia] {
+        let query = """
+        query {
+          Page(page: 1, perPage: \(DataSaver.rowLength(20))) {
+            media(type: ANIME, sort: SCORE_DESC, isAdult: false) {
+              id
+              title { romaji english native }
+              coverImage { large extraLarge }
+              bannerImage
+              averageScore
+              genres
+              description(asHtml: false)
+            }
+          }
+        }
+        """
+        return try await fetchPage(query: query)
+    }
+
+    func browse(category: BrowseCategory, page: Int) async throws -> [AniListMedia] {
+        switch category {
+        case .trending:
+            let query = """
+            query ($page: Int) {
+              Page(page: $page, perPage: 20) {
+                media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  bannerImage
+                  averageScore
+                  genres
+                  description(asHtml: false)
+                }
+              }
+            }
+            """
+            return try await fetchPage(query: query, variables: ["page": page])
+
+        case .seasonal:
+            let (season, year) = AniListSeason.current()
+            let query = """
+            query ($season: MediaSeason, $year: Int, $page: Int) {
+              Page(page: $page, perPage: 20) {
+                media(season: $season, seasonYear: $year, type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  bannerImage
+                  averageScore
+                  genres
+                  description(asHtml: false)
+                }
+              }
+            }
+            """
+            return try await fetchPage(query: query, variables: ["season": season.rawValue, "year": year, "page": page])
+
+        case .lastSeason:
+            let (season, year) = AniListSeason.previous()
+            let query = """
+            query ($season: MediaSeason, $year: Int, $page: Int) {
+              Page(page: $page, perPage: 20) {
+                media(season: $season, seasonYear: $year, type: ANIME, status: FINISHED, sort: POPULARITY_DESC, isAdult: false) {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  bannerImage
+                  averageScore
+                  genres
+                  description(asHtml: false)
+                }
+              }
+            }
+            """
+            return try await fetchPage(query: query, variables: ["season": season.rawValue, "year": year, "page": page])
+
+        case .popular:
+            let query = """
+            query ($page: Int) {
+              Page(page: $page, perPage: 20) {
+                media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  bannerImage
+                  averageScore
+                  genres
+                  description(asHtml: false)
+                }
+              }
+            }
+            """
+            return try await fetchPage(query: query, variables: ["page": page])
+
+        case .topRated:
+            let query = """
+            query ($page: Int) {
+              Page(page: $page, perPage: 20) {
+                media(type: ANIME, sort: SCORE_DESC, isAdult: false) {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  bannerImage
+                  averageScore
+                  genres
+                  description(asHtml: false)
+                }
+              }
+            }
+            """
+            return try await fetchPage(query: query, variables: ["page": page])
+        }
+    }
+
+    func detail(id: Int) async throws -> AniListMedia {
+        let query = """
+        query ($id: Int) {
+          Media(id: $id, type: ANIME, isAdult: false) {
+            id
+            idMal
+            title { romaji english native }
+            coverImage { large extraLarge }
+            bannerImage
+            description(asHtml: false)
+            episodes
+            status
+            nextAiringEpisode {
+              episode
+            }
+            averageScore
+            genres
+            season
+            seasonYear
+            relations {
+              edges {
+                relationType
+                node {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  status
+                  type
+                  format
+                }
+              }
+            }
+          }
+        }
+        """
+        let data = try await post(query: query, variables: ["id": id])
+        let response = try JSONDecoder().decode(GraphQLResponse<MediaData>.self, from: data)
+        if let errors = response.errors {
+            if errors.contains(where: { $0.status == 403 }) { throw AniListError.httpError(403) }
+            throw AniListError.graphQL(errors.map(\.message).joined(separator: ", "))
+        }
+        guard let media = response.data?.Media else {
+            throw AniListError.noData
+        }
+        return media
+    }
+
+    /// AniList detail for a MANGA id. Mirrors `detail(id:)` but queries the manga
+    /// media type (chapters instead of episodes, no airing) and includes relations.
+    func mangaDetail(id: Int) async throws -> AniListMedia {
+        let query = """
+        query ($id: Int) {
+          Media(id: $id, type: MANGA, isAdult: false) {
+            id
+            idMal
+            title { romaji english native }
+            coverImage { large extraLarge }
+            bannerImage
+            description(asHtml: false)
+            chapters
+            status
+            averageScore
+            genres
+            relations {
+              edges {
+                relationType
+                node {
+                  id
+                  title { romaji english native }
+                  coverImage { large extraLarge }
+                  status
+                  type
+                  format
+                }
+              }
+            }
+          }
+        }
+        """
+        let data = try await post(query: query, variables: ["id": id])
+        let response = try JSONDecoder().decode(GraphQLResponse<MediaData>.self, from: data)
+        if let errors = response.errors {
+            if errors.contains(where: { $0.status == 403 }) { throw AniListError.httpError(403) }
+            throw AniListError.graphQL(errors.map(\.message).joined(separator: ", "))
+        }
+        guard let media = response.data?.Media else { throw AniListError.noData }
+        return media
+    }
+
+    // MARK: - Private helpers
+
+    private func fetchPage(query: String, variables: [String: Any] = [:]) async throws -> [AniListMedia] {
+        let data = try await post(query: query, variables: variables)
+        let response = try JSONDecoder().decode(GraphQLResponse<PageData>.self, from: data)
+        if let errors = response.errors {
+            if errors.contains(where: { $0.status == 403 }) { throw AniListError.httpError(403) }
+            throw AniListError.graphQL(errors.map(\.message).joined(separator: ", "))
+        }
+        return response.data?.Page.media ?? []
+    }
+
+    /// How many times to retry a rate-limited request before giving up and letting the error
+    /// surface. Kept low so the UI never hangs for long on what is effectively the home screen.
+    private let maxRateLimitRetries = 2
+
+    private func post(query: String, variables: [String: Any]) async throws -> Data {
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        let bodyDict: [String: Any] = ["query": query, "variables": variables]
+        request.httpBody = try JSONSerialization.data(withJSONObject: bodyDict, options: [])
+
+        Logger.shared.log("AniList Request: \(bodyDict)", type: "Network")
+
+        var attempt = 0
+        while true {
+            await AniListThrottle.shared.waitForTurn()
+            let (data, response) = try await session.data(for: request)
+
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                Logger.shared.log("AniList Response: \(json)", type: "Network")
+            }
+
+            guard let http = response as? HTTPURLResponse else { return data }
+            switch http.statusCode {
+            case 200:
+                await AniListThrottle.shared.reportSuccess()
+                return data
+            case 429, 403:
+                // AniList explains itself in the body even when the status is a plain 403 —
+                // "The AniList API has been temporarily disabled due to severe stability
+                // issues", for instance. Reporting the status code alone sent people hunting
+                // for a bug in the app over an outage it has no part in.
+                let message = Self.graphQLErrorMessage(in: data)
+
+                // An announced outage is not a rate limit, and must not be treated as one.
+                // AniList switches the whole API off during its stability incidents and says so
+                // in the body; every request gets the same 403 instantly. Retrying means three
+                // requests at a service that is telling us it is down, and reporting it to the
+                // throttle widens the gap for *every* AniList call afterwards — so an outage
+                // used to make the rest of the app progressively slower for no benefit.
+                if http.statusCode == 403, let message, Self.isAnnouncedOutage(message) {
+                    Logger.shared.log("[AniList] API reports itself disabled — not retrying: \(message)", type: "Network")
+                    throw AniListError.serviceMessage(code: 403, message: message)
+                }
+
+                // A real rate limit (429), or a bare 403 with no explanation — which is what
+                // edge/Cloudflare throttling looks like. Back off collectively and retry.
+                let retryAfter = http.value(forHTTPHeaderField: "Retry-After").flatMap { Double($0) }
+                await AniListThrottle.shared.reportRateLimited(retryAfter: retryAfter)
+                if attempt < maxRateLimitRetries {
+                    Logger.shared.log("[AniList] HTTP \(http.statusCode) rate limited — retrying (attempt \(attempt + 1)/\(maxRateLimitRetries))", type: "Network")
+                    attempt += 1
+                    continue
+                }
+                Logger.shared.log("[AniList] HTTP \(http.statusCode) rate limited — giving up after \(maxRateLimitRetries) retries", type: "Network")
+                if let message {
+                    throw AniListError.serviceMessage(code: http.statusCode, message: message)
+                }
+                throw http.statusCode == 429 ? AniListError.rateLimited : AniListError.httpError(403)
+            default:
+                if let message = Self.graphQLErrorMessage(in: data) {
+                    // Carries the status as well as the wording: the message is for the reader,
+                    // but the code still decides whether a queued write should be retried later.
+                    throw AniListError.serviceMessage(code: http.statusCode, message: message)
+                }
+                throw AniListError.httpError(http.statusCode)
+            }
+        }
+    }
+}
+
+// MARK: - Errors
+
+extension AniListService {
+    /// Whether AniList's own error wording says the API is deliberately switched off, rather
+    /// than that this app asked for too much.
+    ///
+    /// During its stability incidents AniList disables the whole API and answers every request —
+    /// down to `{ Media(id: 1) { id } }` — with a 403 and "The AniList API has been temporarily
+    /// disabled due to severe stability issues." That is an outage to wait out, not a rate limit
+    /// to back off from: retrying can't help, and feeding it to the throttle only slows down
+    /// everything else the app does with AniList afterwards.
+    static func isAnnouncedOutage(_ message: String) -> Bool {
+        let m = message.lowercased()
+        guard m.contains("api") else { return false }
+        return m.contains("disabled") || m.contains("temporarily unavailable")
+    }
+
+    /// Whether AniList's response says it refused the access token itself.
+    ///
+    /// AniList rejects a token with **400 and "Invalid token"**, never 401 — any
+    /// `Authorization` header it won't accept answers
+    /// `{"errors":[{"message":"Invalid token","status":400}]}` for *any* query, public ones
+    /// included, and it answers that ahead of every other gate (unauthenticated traffic during
+    /// an announced outage gets the 403, a bad token gets the 400). So the `case 401` branches
+    /// the authenticated call sites hung "genuine auth failure" on never fire, and a refused
+    /// token fell through to the transient bucket: the token was kept, `isLoggedIn` stayed
+    /// true, and every authenticated screen re-sent it, turning one bad token into a bare
+    /// "HTTP error 400" on the library, profile, social feed and notifications at once with no
+    /// route back to a sign-in prompt.
+    ///
+    /// Narrow on purpose — 400 *and* the token wording. A 400 AniList explains some other way
+    /// stays transient, and 403/5xx are left to the outage and rate-limit paths that already
+    /// own them. This app cannot tell a genuinely revoked token from AniList's auth layer
+    /// failing valid ones during one of its own stability incidents, so a match points the user
+    /// at signing in again rather than clearing the session out from under them.
+    static func isTokenRejection(status: Int, message: String?) -> Bool {
+        guard status == 400, let message else { return false }
+        return message.lowercased().contains("invalid token")
+    }
+
+    /// The first human-readable message from a GraphQL `errors` array, if the body carries one.
+    static func graphQLErrorMessage(in data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let errors = root["errors"] as? [[String: Any]] else { return nil }
+        let message = errors.compactMap { $0["message"] as? String }
+            .first { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return message
+    }
+}
+
+enum AniListError: LocalizedError {
+    case rateLimited
+    case httpError(Int)
+    /// A failure the service explained in its response body. Keeps the status so retry policy
+    /// is unchanged — an outage is still worth queueing a write against.
+    case serviceMessage(code: Int, message: String)
+    /// AniList refused the access token (400 + "Invalid token" — see `isTokenRejection`).
+    /// Distinct from a transient failure: the same token cannot succeed on a retry, so callers
+    /// stop instead of spending their retry budget, and the user is pointed at signing in
+    /// again. Deliberately does not clear the session — see `isTokenRejection`.
+    case tokenRejected
+    case graphQL(String)
+    case noData
+    case decodingError(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .rateLimited:
+            return "AniList rate limit reached. Please wait a moment."
+        case .httpError(let code):
+            return "HTTP error \(code). Please try again."
+        case .serviceMessage(_, let message):
+            return message
+        case .tokenRejected:
+            // Names the remedy, not the status. A bare "HTTP error 400" on every authenticated
+            // screen was the original complaint.
+            return "AniList didn't accept your sign-in. Sign in to AniList again to keep syncing."
+
+        case .graphQL(let message):
+            // The service's own wording, unadorned — prefixing it with "AniList error:" made
+            // sentences like "The AniList API has been temporarily disabled…" read twice.
+            return message
+        case .noData:
+            return "No data received from AniList."
+        case .decodingError(let message):
+            return "Failed to parse response: \(message)"
+        }
+    }
+}
+
+// MARK: - AniList Mapping Manager
+
+/// Manages persistent mappings between standard module titles and AniList IDs.
+final class AniListMappingManager {
+    nonisolated(unsafe) static let shared = AniListMappingManager()
+    
+    private let userDefaults = UserDefaults.standard
+    private let storageKey = "com.shirox.anilist_mappings"
+    
+    // Dictionary of moduleTitle -> aniListID
+    private var mappings: [String: Int] = [:]
+    
+    private init() {
+        loadMappings()
+    }
+    
+    func saveMapping(title: String, aniListID: Int) {
+        mappings[title.lowercased()] = aniListID
+        persist()
+    }
+    
+    func getMapping(title: String) -> Int? {
+        return mappings[title.lowercased()]
+    }
+    
+    func removeMapping(title: String) {
+        mappings.removeValue(forKey: title.lowercased())
+        persist()
+    }
+    
+    private func loadMappings() {
+        if let data = userDefaults.data(forKey: storageKey),
+           let decoded = try? JSONDecoder().decode([String: Int].self, from: data) {
+            self.mappings = decoded
+        }
+    }
+    
+    private func persist() {
+        if let encoded = try? JSONEncoder().encode(mappings) {
+            userDefaults.set(encoded, forKey: storageKey)
+        }
+    }
+}
+
+// MARK: - Browse Category
+
+enum BrowseCategory: String, CaseIterable, Hashable {
+    case trending
+    case seasonal
+    case lastSeason
+    case popular
+    case topRated
+
+    var title: String {
+        switch self {
+        case .trending:   return "Trending Now"
+        case .seasonal:   return "This Season"
+        case .lastSeason: return "Last Season · Complete"
+        case .popular:    return "All-Time Popular"
+        case .topRated:   return "Top Rated"
+        }
+    }
+}
+
+// MARK: - TVDB Mapping Service
+
+@MainActor final class TVDBMappingService: ObservableObject {
+    static let shared = TVDBMappingService()
+    private let mappingEndpoint = "https://api.anira.dev/mappings/"
+    private let tvdbEndpoint = "https://api4.thetvdb.com/v4"
+    private let apiKey = "4cd66d53-3c21-45a7-9dd2-e4a9c2ed20a8"
+    private let cacheKey = "tvdb_mappings_cache_v4"
+    private let malCacheKey = "tvdb_mal_mappings_cache_v1"
+    private let bulkFetchedAtKey = "anira_all_mappings_fetchedAt_v1"
+    /// How long a cached /mappings/all snapshot is considered fresh before re-fetching.
+    private let bulkTTL: TimeInterval = 60 * 60 * 24  // 1 day
+
+    @Published private var token: String?
+    private var tokenExpiry: Date?
+
+    // Cache: AniListID or MALID -> (TVDB_ID, SeasonNumber, PosterPath?, FanartPath?)
+    struct CachedData: Codable {
+        let tid: Int
+        var season: Int?
+        var epOffset: Int?
+        var epOffsetFetched: Bool?  // nil = old entry (pre-epOffset), true = fetched fresh
+        var posterPath: String?
+        var fanartPath: String?
+    }
+    private var cache: [Int: CachedData] = [:]       // keyed by AniList ID
+    private var malCache: [Int: CachedData] = [:]     // keyed by MAL ID
+    private var episodeCache: [Int: [AniMapEpisode]] = [:]
+    private var malEpisodeCache: [Int: [AniMapEpisode]] = [:]
+    private var aniraEpisodeCache: [String: AniraEpisodeResponse] = [:]
+    private var watchOrderCache: [Int: [AniraMediaEntry]] = [:]
+
+    // Bulk ID-mapping snapshot from anira's /mappings/all — resolved locally instead of
+    // hitting the per-id endpoint once per show. Seeded from disk on first use, refreshed
+    // over the network when stale (see loadAllMappings).
+    private var anilistMappingIndex: [Int: BulkMapping] = [:]
+    private var malMappingIndex: [Int: BulkMapping] = [:]
+    private var bulkLoaded = false
+    private var bulkLoadTask: Task<Void, Never>?
+
+    /// Subset of an anira /mappings/all entry we actually consume for TVDB resolution.
+    struct BulkMapping: Codable, Sendable {
+        let mal_id: Int?
+        let anilist_id: Int?
+        let tvdb_id: Int?
+        let tvdb_season: Int?
+        let tvdb_epoffset: Int?
+    }
+
+    struct AniraEpisodeResponse: Decodable {
+        struct Skip: Decodable {
+            let type: String
+            let start: Double
+            let end: Double
+        }
+        let episode: Int
+        let title: String?
+        let description: String?
+        let thumbnail: String?
+        let skips: [Skip]?
+    }
+
+    /// One entry from Anira's `/watch_order` (and identically-shaped `/similar`) response.
+    /// `mappings.anilist_id` can be null for entries that only exist on other databases.
+    struct AniraMediaEntry: Decodable, Identifiable {
+        let title: String?
+        let cover: String?
+        let mappings: Mappings
+
+        struct Mappings: Decodable {
+            let anilist_id: Int?
+            let mal_id: Int?
+            let media_type: String?
+        }
+
+        /// Stable list identity — prefers AniList id, then MAL id, then title.
+        var id: String { "\(mappings.anilist_id ?? mappings.mal_id ?? 0)-\(title ?? "")" }
+    }
+
+    private static let session: URLSession = {
+        let cfg = URLSessionConfiguration.default
+        cfg.urlCache = nil
+        cfg.timeoutIntervalForRequest = 10
+        cfg.timeoutIntervalForResource = 20
+        return URLSession(configuration: cfg)
+    }()
+
+    private init() {
+        if let data = UserDefaults.standard.data(forKey: cacheKey),
+           let decoded = try? JSONDecoder().decode([Int: CachedData].self, from: data) {
+            self.cache = decoded
+        }
+        if let data = UserDefaults.standard.data(forKey: malCacheKey),
+           let decoded = try? JSONDecoder().decode([Int: CachedData].self, from: data) {
+            self.malCache = decoded
+        }
+    }
+
+    private func authenticate() async throws -> String {
+        if let t = token, let expiry = tokenExpiry, expiry > Date() {
+            return t
+        }
+
+        struct LoginResponse: Decodable {
+            struct Data: Decodable { let token: String }
+            let data: Data
+        }
+
+        var request = URLRequest(url: URL(string: "\(tvdbEndpoint)/login")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["apikey": apiKey])
+
+        let (data, _) = try await Self.session.data(for: request)
+        let res = try JSONDecoder().decode(LoginResponse.self, from: data)
+        self.token = res.data.token
+        self.tokenExpiry = Date().addingTimeInterval(3600 * 24 * 25) // Token usually lasts 1 month
+        return res.data.token
+    }
+
+    private func mappingKey(for provider: ProviderType) -> String {
+        provider == .mal ? "myanimelist" : "anilist"
+    }
+
+    private func tvdbCache(for provider: ProviderType) -> [Int: CachedData] {
+        provider == .mal ? malCache : cache
+    }
+
+    private func setTVDBCache(_ data: CachedData, id: Int, provider: ProviderType) {
+        if provider == .mal { malCache[id] = data } else { cache[id] = data }
+    }
+
+    func getTVDBId(for id: Int, provider: ProviderType = .anilist) async -> (id: Int, season: Int?)? {
+        let cached = tvdbCache(for: provider)[id]
+        // Only return from cache if we have a definitive result:
+        // - tid < 0 means we already know there's no mapping
+        // - epOffsetFetched == true means the entry was populated from a full fresh fetch
+        if let cached, cached.tid < 0 { return nil }
+        if let cached, cached.epOffsetFetched == true { return (cached.tid, cached.season) }
+
+        // Primary: resolve from the bulk /mappings/all snapshot (one cached fetch, no per-id call).
+        await loadAllMappings()
+        let index = provider == .mal ? malMappingIndex : anilistMappingIndex
+        if let m = index[id] {
+            if let tid = m.tvdb_id {
+                setTVDBCache(CachedData(tid: tid, season: m.tvdb_season, epOffset: m.tvdb_epoffset,
+                                        epOffsetFetched: true,
+                                        posterPath: cached?.posterPath, fanartPath: cached?.fanartPath),
+                             id: id, provider: provider)
+                provider == .mal ? saveMALCache() : saveCache()
+                return (tid, m.tvdb_season)
+            }
+            // Present in the snapshot but no TVDB id → definitively no TVDB mapping.
+            setTVDBCache(CachedData(tid: -1, season: nil, epOffsetFetched: true), id: id, provider: provider)
+            provider == .mal ? saveMALCache() : saveCache()
+            return nil
+        }
+
+        // Fallback: id absent from the snapshot (e.g. added after the last refresh) — one per-id lookup.
+        do {
+            let key = mappingKey(for: provider)
+            guard let url = URL(string: "\(mappingEndpoint)\(id)?mapping_key=\(key)") else { return nil }
+            let (data, _) = try await Self.session.data(for: URLRequest(url: url))
+            struct Mapping: Decodable { let tvdb_id: Int?; let tvdb_season: Int?; let tvdb_epoffset: Int? }
+            let results = try JSONDecoder().decode([Mapping].self, from: data)
+            if let first = results.first, let tid = first.tvdb_id {
+                setTVDBCache(CachedData(tid: tid, season: first.tvdb_season, epOffset: first.tvdb_epoffset, epOffsetFetched: true), id: id, provider: provider)
+                provider == .mal ? saveMALCache() : saveCache()
+                return (tid, first.tvdb_season)
+            } else {
+                setTVDBCache(CachedData(tid: -1, season: nil, epOffsetFetched: true), id: id, provider: provider)
+                provider == .mal ? saveMALCache() : saveCache()
+            }
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+        } catch {
+            Logger.shared.log("TVDB mapping error (\(provider.rawValue)): \(error)", type: "Error")
+        }
+        return nil
+    }
+
+    // MARK: - Bulk /mappings/all
+
+    /// Ensures the bulk mapping snapshot is loaded (deduping concurrent callers).
+    private func loadAllMappings() async {
+        if bulkLoaded { return }
+        if let task = bulkLoadTask { await task.value; return }
+        let task = Task { await performLoadAllMappings() }
+        bulkLoadTask = task
+        await task.value
+        bulkLoadTask = nil
+    }
+
+    private func performLoadAllMappings() async {
+        // 1. Seed from disk (any age) for instant availability.
+        if anilistMappingIndex.isEmpty, let disk = await loadBulkFromDisk() {
+            buildMappingIndices(from: disk)
+        }
+        // 2. Refresh from the network when we have nothing yet or the snapshot is stale.
+        let fetchedAt = UserDefaults.standard.double(forKey: bulkFetchedAtKey)
+        let isStale = Date().timeIntervalSince1970 - fetchedAt > bulkTTL
+        if anilistMappingIndex.isEmpty || isStale {
+            if let entries = await fetchAllMappings(), !entries.isEmpty {
+                buildMappingIndices(from: entries)
+                saveBulkToDisk(entries)
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: bulkFetchedAtKey)
+            }
+        }
+        // Only latch as "loaded" once we actually have data, so a failed cold start retries later.
+        bulkLoaded = !anilistMappingIndex.isEmpty
+    }
+
+    private func fetchAllMappings() async -> [BulkMapping]? {
+        guard let url = URL(string: "\(mappingEndpoint)all") else { return nil }
+        do {
+            let (data, resp) = try await Self.session.data(for: URLRequest(url: url))
+            guard (resp as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+            // Decode the ~7MB payload off the main actor to avoid a UI hitch.
+            return try await Task.detached(priority: .utility) {
+                try JSONDecoder().decode([BulkMapping].self, from: data)
+            }.value
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+            return nil
+        } catch {
+            Logger.shared.log("anira /mappings/all fetch failed: \(error)", type: "Error")
+            return nil
+        }
+    }
+
+    private func buildMappingIndices(from entries: [BulkMapping]) {
+        var ani: [Int: BulkMapping] = [:]
+        var mal: [Int: BulkMapping] = [:]
+        ani.reserveCapacity(entries.count)
+        mal.reserveCapacity(entries.count)
+        for e in entries {
+            if let a = e.anilist_id { ani[a] = e }
+            if let m = e.mal_id { mal[m] = e }
+        }
+        anilistMappingIndex = ani
+        malMappingIndex = mal
+    }
+
+    private var bulkFileURL: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("anira_all_mappings_v1.json")
+    }
+
+    private func saveBulkToDisk(_ entries: [BulkMapping]) {
+        guard let url = bulkFileURL else { return }
+        Task.detached(priority: .background) {
+            guard let data = try? JSONEncoder().encode(entries) else { return }
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+
+    private func loadBulkFromDisk() async -> [BulkMapping]? {
+        guard let url = bulkFileURL else { return nil }
+        return await Task.detached(priority: .utility) {
+            guard let data = try? Data(contentsOf: url) else { return nil }
+            return try? JSONDecoder().decode([BulkMapping].self, from: data)
+        }.value
+    }
+
+    /// Returns true if we've already checked TVDB for this ID (result may be positive or negative).
+    func hasMappingResolved(for id: Int, provider: ProviderType = .anilist) -> Bool {
+        tvdbCache(for: provider)[id] != nil
+    }
+
+    func cachedSeason(for id: Int, provider: ProviderType = .anilist) -> Int? {
+        tvdbCache(for: provider)[id]?.season
+    }
+
+    func cachedEpOffset(for id: Int, provider: ProviderType = .anilist) -> Int? {
+        tvdbCache(for: provider)[id]?.epOffset
+    }
+
+    func fetchAniraEpisode(id: Int, episodeNumber: Int, mappingKey: String = "anilist") async -> AniraEpisodeResponse? {
+        let key = "\(id)-\(episodeNumber)-\(mappingKey)"
+        if let cached = aniraEpisodeCache[key] { return cached }
+        guard let url = URL(string: "https://api.anira.dev/media/\(id)/episodes/\(episodeNumber)?mapping_key=\(mappingKey)"),
+              let (data, _) = try? await Self.session.data(for: URLRequest(url: url)),
+              let result = try? JSONDecoder().decode(AniraEpisodeResponse.self, from: data)
+        else { return nil }
+        aniraEpisodeCache[key] = result
+        return result
+    }
+
+    /// Anira's recommended franchise watch order for a title. Returns [] when Anira has no
+    /// data or returns a non-array error body for an unmapped id (mirrors the defensive
+    /// decoding used for episodes). Cached in-memory per id.
+    func fetchWatchOrder(id: Int, provider: ProviderType = .anilist) async -> [AniraMediaEntry] {
+        if let cached = watchOrderCache[id] { return cached }
+        let key = mappingKey(for: provider)
+        guard let url = URL(string: "https://api.anira.dev/media/\(id)/watch_order?mapping_key=\(key)"),
+              let (data, _) = try? await Self.session.data(for: URLRequest(url: url)),
+              let results = try? JSONDecoder().decode([AniraMediaEntry].self, from: data)
+        else { return [] }
+        watchOrderCache[id] = results
+        return results
+    }
+
+    func getCachedArtwork(for id: Int, provider: ProviderType = .anilist) -> (poster: String?, fanart: String?) {
+        if let c = tvdbCache(for: provider)[id] {
+            return (formatURL(c.posterPath), formatURL(c.fanartPath))
+        }
+        return (nil, nil)
+    }
+
+    func getArtwork(for id: Int, provider: ProviderType = .anilist) async -> (poster: String?, fanart: String?) {
+        if let c = tvdbCache(for: provider)[id], c.posterPath != nil || c.fanartPath != nil {
+            return (formatURL(c.posterPath), formatURL(c.fanartPath))
+        }
+        guard let mapping = await getTVDBId(for: id, provider: provider), mapping.id > 0 else {
+            return (nil, nil)
+        }
+        let artwork = await fetchTVDBIdArtwork(tid: mapping.id, targetSeason: mapping.season)
+        if provider == .mal {
+            malCache[id]?.posterPath = artwork.poster
+            malCache[id]?.fanartPath = artwork.fanart
+            saveMALCache()
+        } else {
+            cache[id]?.posterPath = artwork.poster
+            cache[id]?.fanartPath = artwork.fanart
+            saveCache()
+        }
+        return (formatURL(artwork.poster), formatURL(artwork.fanart))
+    }
+
+
+    private func getEpisodesAniList(_ aniListId: Int) async -> [AniMapEpisode] {
+        if let cached = episodeCache[aniListId] {
+            return cached
+        }
+        
+        // 1. Try the AniMap media episodes endpoint first (highly detailed)
+        var aniMapResults: [AniMapEpisode] = []
+        do {
+            let urlString = "https://api.anira.dev/media/\(aniListId)/episodes?mapping_key=anilist"
+            guard let url = URL(string: urlString) else { throw URLError(.badURL) }
+            let (data, _) = try await Self.session.data(for: URLRequest(url: url))
+            aniMapResults = try JSONDecoder().decode([AniMapEpisode].self, from: data)
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+            return []
+        } catch is DecodingError {
+            // anira returns a non-array body ("Not Found"/error object) for titles it
+            // has no mapping for. Expected — fall through to the TVDB/legacy fallbacks.
+            Logger.shared.log("AniMap media episodes: no anira mapping for \(aniListId)", type: "Debug")
+        } catch {
+            Logger.shared.log("AniMap Media EP Error: \(error)", type: "Error")
+        }
+
+        if !aniMapResults.isEmpty {
+            // If any episode is missing a thumbnail, merge in TVDB images
+            let missingThumbnails = aniMapResults.contains { $0.thumbnail == nil }
+            if missingThumbnails, let mapping = await getTVDBId(for: aniListId), mapping.id > 0 {
+                let tvdbEps = await fetchTVDBEpisodes(tid: mapping.id, season: mapping.season ?? 1)
+                if !tvdbEps.isEmpty {
+                    let tvdbByNumber = Dictionary(uniqueKeysWithValues: tvdbEps.map { ($0.number, $0.image) })
+                    let merged = aniMapResults.map { ep -> AniMapEpisode in
+                        guard ep.thumbnail == nil, let img = tvdbByNumber[ep.episode] ?? tvdbByNumber[ep.absolute ?? -1] else { return ep }
+                        return AniMapEpisode(absolute: ep.absolute, airdate: ep.airdate, description: ep.description,
+                                            episode: ep.episode, filler_type: ep.filler_type, mal_id: ep.mal_id,
+                                            season: ep.season, thumbnail: formatURL(img), title: ep.title)
+                    }
+                    episodeCache[aniListId] = merged
+                    return merged
+                }
+            }
+            episodeCache[aniListId] = aniMapResults
+            return aniMapResults
+        }
+        
+        // 2. Fallback to TVDB extended series data (direct API access)
+        if let mapping = await getTVDBId(for: aniListId), mapping.id > 0 {
+            let tvdbEps = await fetchTVDBEpisodes(tid: mapping.id, season: mapping.season ?? 1)
+            if !tvdbEps.isEmpty {
+                let mapped = tvdbEps.map { te in
+                    AniMapEpisode(absolute: te.number, airdate: nil, description: te.overview,
+                                  episode: te.number, filler_type: nil, mal_id: nil,
+                                  season: te.seasonNumber, thumbnail: formatURL(te.image), title: te.name)
+                }
+                episodeCache[aniListId] = mapped
+                return mapped
+            }
+        }
+        
+        // 3. Last resort fallback to legacy mapping episode endpoint
+        do {
+            let urlString = "\(mappingEndpoint)\(aniListId)/episodes?mapping_key=anilist"
+            guard let url = URL(string: urlString) else { return [] }
+            let (data, _) = try await Self.session.data(for: URLRequest(url: url))
+            let results = try JSONDecoder().decode([AniMapEpisode].self, from: data)
+            episodeCache[aniListId] = results
+            return results
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+            return []
+        } catch is DecodingError {
+            // Legacy mapping endpoint also returns a non-JSON body when it has no data
+            // for this title. Expected — return the empty list below.
+            Logger.shared.log("AniMap mapping episodes: no legacy mapping for \(aniListId)", type: "Debug")
+        } catch {
+            Logger.shared.log("AniMap Mapping EP Error: \(error)", type: "Error")
+        }
+        
+        return []
+    }
+
+    private struct TVDBRawEpisode {
+        let number: Int
+        let seasonNumber: Int
+        let image: String?
+        let name: String?
+        let overview: String?
+    }
+
+    private func fetchTVDBEpisodes(tid: Int, season: Int) async -> [TVDBRawEpisode] {
+        struct TVDBEpisode: Decodable {
+            let number: Int
+            let seasonNumber: Int
+            let image: String?
+            let name: String?
+            let overview: String?
+        }
+        struct TVDBExtendedResponse: Decodable {
+            struct Data: Decodable { let episodes: [TVDBEpisode]? }
+            let data: Data
+        }
+        do {
+            let token = try await authenticate()
+            let url = URL(string: "\(tvdbEndpoint)/series/\(tid)/extended")!
+            var req = URLRequest(url: url)
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            let (data, _) = try await Self.session.data(for: req)
+            let res = try JSONDecoder().decode(TVDBExtendedResponse.self, from: data)
+            return (res.data.episodes ?? [])
+                .filter { $0.seasonNumber == season }
+                .map { TVDBRawEpisode(number: $0.number, seasonNumber: $0.seasonNumber,
+                                     image: $0.image, name: $0.name, overview: $0.overview) }
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+            return []
+        } catch {
+            Logger.shared.log("TVDB EP fetch error: \(error)", type: "Error")
+            return []
+        }
+    }
+
+    func getCachedEpisode(for id: Int, provider: ProviderType = .anilist, episodeNumber: Int) -> AniMapEpisode? {
+        let eps = provider == .mal ? malEpisodeCache[id] : episodeCache[id]
+        return eps?.first(where: { $0.episode == episodeNumber })
+            ?? eps?.first(where: { $0.absolute == episodeNumber })
+    }
+
+    /// Resolves episode metadata for a given episode number, handling absolute/relative
+    /// numbering mismatches via a four-step waterfall.
+    func getEpisode(for id: Int, episodeNumber: Int, provider: ProviderType = .anilist) async -> AniMapEpisode? {
+        // 1. In-memory cache (checks both .episode and .absolute fields)
+        if let hit = getCachedEpisode(for: id, provider: provider, episodeNumber: episodeNumber) {
+            return hit
+        }
+
+        // 2. Fresh network fetch + check both fields
+        let eps = await getEpisodes(for: id, provider: provider)
+        if let hit = eps.first(where: { $0.episode == episodeNumber })
+                     ?? eps.first(where: { $0.absolute == episodeNumber }) {
+            return hit
+        }
+
+        // 3. Offset fallback — ensures epOffset is cached, then tries ±offset variants
+        _ = await getTVDBId(for: id, provider: provider)
+        let offset = cachedEpOffset(for: id, provider: provider) ?? 0
+        guard offset > 0 else { return nil }
+
+        // Module absolute → AniList-relative (e.g. 25 − 24 = 1)
+        let relative = episodeNumber - offset
+        if relative > 0, let hit = eps.first(where: { $0.episode == relative }) {
+            return hit
+        }
+
+        // AniList-relative → absolute (e.g. 1 + 24 = 25)
+        let absolute = episodeNumber + offset
+        if let hit = eps.first(where: { $0.episode == absolute }) {
+            return hit
+        }
+
+        return nil
+    }
+
+    func getEpisodes(for id: Int, provider: ProviderType = .anilist) async -> [AniMapEpisode] {
+        if provider != .mal { return await getEpisodesAniList(id) }
+        if let cached = malEpisodeCache[id] { return cached }
+
+        // 1. Try Anira MAL episodes endpoint first
+        do {
+            guard let url = URL(string: "https://api.anira.dev/media/\(id)/episodes?mapping_key=myanimelist") else { throw URLError(.badURL) }
+            let (data, _) = try await Self.session.data(for: URLRequest(url: url))
+            var results = try JSONDecoder().decode([AniMapEpisode].self, from: data)
+            results = results.map { ep in
+                guard let thumb = ep.thumbnail, !thumb.contains("mapping_key") else { return ep }
+                return AniMapEpisode(absolute: ep.absolute, airdate: ep.airdate, description: ep.description,
+                                    episode: ep.episode, filler_type: ep.filler_type, mal_id: ep.mal_id,
+                                    season: ep.season, thumbnail: thumb + "?mapping_key=myanimelist", title: ep.title)
+            }
+            // If all titles are generic ("Episode N" or nil), fetch real titles from Jikan
+            let allGeneric = results.allSatisfy { ep in
+                guard let t = ep.title else { return true }
+                return t.range(of: #"^Episode \d+$"#, options: .regularExpression) != nil
+            }
+            if allGeneric && !results.isEmpty {
+                let jikanEps = (try? await MALDiscoveryService.shared.episodes(malId: id)) ?? []
+                let titleByNumber = Dictionary(jikanEps.map { ($0.mal_id, $0.title) }, uniquingKeysWith: { $1 })
+                results = results.map { ep in
+                    let title = titleByNumber[ep.episode] ?? ep.title
+                    guard title != ep.title else { return ep }
+                    return AniMapEpisode(absolute: ep.absolute, airdate: ep.airdate, description: ep.description,
+                                        episode: ep.episode, filler_type: ep.filler_type, mal_id: ep.mal_id,
+                                        season: ep.season, thumbnail: ep.thumbnail, title: title)
+                }
+            }
+            if !results.isEmpty {
+                malEpisodeCache[id] = results
+                return results
+            }
+        } catch where (error as? URLError)?.code == .cancelled || error is CancellationError {
+            return []
+        } catch is DecodingError {
+            // anira returns a non-array body for MAL ids it has no mapping for.
+            // Expected — fall through to the TVDB fallback below.
+            Logger.shared.log("Anira MAL episodes: no mapping for malId \(id)", type: "Debug")
+        } catch {
+            Logger.shared.log("Anira MAL episodes error: \(error)", type: "Error")
+        }
+
+        // 2. Fall back to TVDB
+        if let mapping = await getTVDBId(for: id, provider: ProviderType.mal), mapping.id > 0 {
+            let tvdbEps = await fetchTVDBEpisodes(tid: mapping.id, season: mapping.season ?? 1)
+            if !tvdbEps.isEmpty {
+                let mapped = tvdbEps.map { te in
+                    AniMapEpisode(absolute: te.number, airdate: nil, description: te.overview,
+                                  episode: te.number, filler_type: nil, mal_id: nil,
+                                  season: te.seasonNumber, thumbnail: formatURL(te.image), title: te.name)
+                }
+                malEpisodeCache[id] = mapped
+                return mapped
+            }
+        }
+
+        return []
+    }
+
+    private func formatURL(_ path: String?) -> String? {
+        guard let p = path else { return nil }
+        if p.hasPrefix("http") { return p }
+        return "https://artworks.thetvdb.com/banners/\(p)"
+    }
+
+    private func saveCache() {
+        let snapshot = cache
+        let key = cacheKey
+        Task.detached(priority: .background) {
+            guard let encoded = try? JSONEncoder().encode(snapshot) else { return }
+            UserDefaults.standard.set(encoded, forKey: key)
+        }
+    }
+
+    private func saveMALCache() {
+        let snapshot = malCache
+        let key = malCacheKey
+        Task.detached(priority: .background) {
+            guard let encoded = try? JSONEncoder().encode(snapshot) else { return }
+            UserDefaults.standard.set(encoded, forKey: key)
+        }
+    }
+
+    /// Shared TVDB artwork fetch used by both AniList and MAL paths.
+    private func fetchTVDBIdArtwork(tid: Int, targetSeason: Int?) async -> (poster: String?, fanart: String?) {
+        struct Artwork: Decodable {
+            let image: String
+            let type: Int
+            let width: Int?
+            let height: Int?
+        }
+        struct SeasonType: Decodable { let id: Int; let type: String? }
+        struct Season: Decodable { let id: Int; let number: Int; let type: SeasonType? }
+        struct SeriesExtended: Decodable {
+            struct Data: Decodable { let artworks: [Artwork]?; let seasons: [Season]? }
+            let data: Data
+        }
+        struct SeasonExtended: Decodable {
+            struct Data: Decodable { let artwork: [Artwork]? }
+            let data: Data
+        }
+        do {
+            let token = try await authenticate()
+
+            func fetchSeriesExtended() async -> SeriesExtended.Data? {
+                let url = URL(string: "\(tvdbEndpoint)/series/\(tid)/extended")!
+                var req = URLRequest(url: url)
+                req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                guard let (data, _) = try? await Self.session.data(for: req),
+                      let res = try? JSONDecoder().decode(SeriesExtended.self, from: data) else { return nil }
+                return res.data
+            }
+            func fetchSeasonArtwork(seasonId: Int) async -> [Artwork] {
+                let url = URL(string: "\(tvdbEndpoint)/seasons/\(seasonId)/extended")!
+                var req = URLRequest(url: url)
+                req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+                guard let (data, _) = try? await Self.session.data(for: req),
+                      let res = try? JSONDecoder().decode(SeasonExtended.self, from: data) else { return [] }
+                return res.data.artwork ?? []
+            }
+
+            guard let seriesData = await fetchSeriesExtended() else { return (nil, nil) }
+            let artworks = seriesData.artworks ?? []
+            let bySize: (Artwork, Artwork) -> Bool = { ($0.width ?? 0) * ($0.height ?? 0) > ($1.width ?? 0) * ($1.height ?? 0) }
+            let fanart = artworks.filter { $0.type == 3 }.sorted(by: bySize).first?.image
+
+            var poster: String?
+            if let targetSeason {
+                let officialSeasons = seriesData.seasons?.filter { $0.type?.type == "official" || $0.type?.id == 1 }
+                if let seasonId = officialSeasons?.first(where: { $0.number == targetSeason })?.id {
+                    let seasonArtworks = await fetchSeasonArtwork(seasonId: seasonId)
+                    poster = seasonArtworks.filter { $0.type == 7 }.sorted(by: bySize).first?.image
+                        ?? seasonArtworks.sorted(by: bySize).first?.image
+                }
+            }
+            if poster == nil {
+                poster = artworks.filter { $0.type == 2 }.sorted(by: bySize).first?.image
+            }
+            return (poster, fanart)
+        } catch {
+            Logger.shared.log("TVDB artwork fetch error: \(error)", type: "Error")
+            return (nil, nil)
+        }
+    }
+    }
+
+    struct AniMapEpisode: Codable, Identifiable {
+    var id: String { "\(episode)-\(season ?? 0)" }
+    let absolute: Int?
+    let airdate: String?
+    let description: String?
+    let episode: Int
+    let filler_type: String?
+    let mal_id: Int?
+    let season: Int?
+    let thumbnail: String?
+    let title: String?
+    }

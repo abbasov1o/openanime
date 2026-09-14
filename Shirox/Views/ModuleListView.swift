@@ -1,0 +1,646 @@
+import SwiftUI
+
+struct ModuleListView: View {
+    @EnvironmentObject private var moduleManager: ModuleManager
+    @ObservedObject private var providerManager = ProviderManager.shared
+    @Environment(\.dismiss) private var dismiss
+    @State private var moduleURL = ""
+    @State private var isRefreshing = false
+    @State private var isAddingModule = false
+    @State private var addModuleError: String?
+    @State private var isAddingLocalModule = false
+    @State private var isAddingJellyfinModule = false
+    @FocusState private var isTextFieldFocused: Bool
+
+    private let localFilesModuleURL = "https://raw.githubusercontent.com/xibrox/local-files-module/refs/heads/main/local.json"
+    private let jellyfinModuleURL = "https://raw.githubusercontent.com/xibrox/jellyfin-module/refs/heads/main/jellyfin.json"
+
+    var body: some View {
+        List {
+                Section {
+                    addModuleCard
+                }
+                .listRowInsets(EdgeInsets())
+                .listRowBackground(Color.clear)
+
+                if !isLocalModuleInstalled {
+                    Section {
+                        localFilesPromoCard
+                    }
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                }
+
+                if !isJellyfinModuleInstalled {
+                    Section {
+                        jellyfinPromoCard
+                    }
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                }
+
+                if let error = addModuleError {
+                    Section {
+                        errorBanner(error)
+                    }
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                }
+
+                if let error = moduleManager.errorMessage {
+                    Section {
+                        errorBanner(error)
+                    }
+                    .listRowInsets(EdgeInsets())
+                    .listRowBackground(Color.clear)
+                }
+
+                Section {
+                    ForEach(ProviderType.userProviders, id: \.self) { type in
+                        builtInProviderRow(type)
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                    }
+
+                    if moduleManager.modules.isEmpty {
+                        emptyModulesView
+                            .listRowInsets(EdgeInsets())
+                            .listRowBackground(Color.clear)
+                    } else {
+                        ForEach(moduleManager.modules) { module in
+                            moduleRow(module)
+                                .listRowInsets(EdgeInsets())
+                                .listRowBackground(Color.clear)
+                                .contextMenu {
+                                    shareModuleActions(module)
+                                    Button(role: .destructive) {
+                                        removeModule(module)
+                                    } label: {
+                                        Label("Remove", systemImage: "trash")
+                                    }
+                                }
+                        }
+                        .onMove(perform: moduleManager.moveModules)
+                    }
+                } header: {
+                    Text("Sources")
+                        .font(.footnote.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .textCase(.uppercase)
+                }
+            }
+            .softScrollEdges()
+            #if os(iOS)
+            .listStyle(.insetGrouped)
+            #elseif !os(tvOS)
+            .listStyle(.inset)
+            #endif
+            .hideScrollContentBackground()
+            #if os(iOS)
+            .scrollDismissesKeyboardImmediately()
+            #endif
+            #if os(iOS)
+            .background(Color(.systemBackground))
+            #elseif os(tvOS)
+            // TODO: add back background color
+            #else
+            .background(Color(NSColor.windowBackgroundColor))
+            #endif
+            .navigationTitle("Modules")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .automatic) {
+                    Button {
+                        Task {
+                            isRefreshing = true
+                            await moduleManager.checkForUpdates()
+                            isRefreshing = false
+                        }
+                    } label: {
+                        if isRefreshing {
+                            ProgressView().scaleEffect(0.8)
+                        } else {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 14, weight: .medium))
+                        }
+                    }
+                    .disabled(moduleManager.modules.isEmpty || isRefreshing)
+                }
+                #if os(iOS)
+                ToolbarItem(placement: .automatic) {
+                    EditButton()
+                }
+                #endif
+            }
+        .onChangeOf(moduleURL) { _ in
+            addModuleError = nil
+            moduleManager.errorMessage = nil
+        }
+    }
+
+    // MARK: - Add Module Card
+    private var addModuleCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Add Module")
+                .font(.footnote.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.horizontal, 16)
+
+            HStack(spacing: 10) {
+                Image(systemName: "link")
+                    .foregroundStyle(.secondary)
+                    .frame(width: 20)
+
+                TextField("Module JSON URL", text: $moduleURL)
+                    .textContentType(.URL)
+                    .autocorrectionDisabled()
+                    #if os(iOS)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.URL)
+                    #endif
+                    .focused($isTextFieldFocused)
+                    .disabled(isAddingModule)
+                    .onSubmit {
+                        addModule()
+                    }
+
+                Button {
+                    addModule()
+                } label: {
+                    if isAddingModule {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                            .frame(width: 28, height: 28)
+                    } else {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.title2)
+                            .foregroundStyle(moduleURL.isEmpty ? Color.secondary : Color.primary)
+                    }
+                }
+                .buttonStyle(.plain)
+                .disabled(moduleURL.isEmpty || isAddingModule)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        }
+        .padding(.vertical, 8)
+        .background(Color.clear)
+    }
+
+    // MARK: - Local Files Promo
+    private var isLocalModuleInstalled: Bool {
+        moduleManager.modules.contains { $0.isLocalPlayback }
+    }
+
+    private var localFilesPromoCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "folder.badge.plus")
+                    .font(.title2)
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+                    .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Play Local Files")
+                        .font(.headline)
+                    Text("Watch videos from your device's Files app — subtitles, AirPlay, PiP, and Continue Watching included.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text(localFilesModuleURL)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                Button {
+                    copyLocalFilesURL()
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button {
+                addLocalFilesModule()
+            } label: {
+                HStack {
+                    Spacer()
+                    if isAddingLocalModule {
+                        ProgressView().scaleEffect(0.8)
+                    } else {
+                        Label("Add Module", systemImage: "plus.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.primary)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 10)
+                .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+            .disabled(isAddingLocalModule)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Jellyfin Promo
+    private var isJellyfinModuleInstalled: Bool {
+        moduleManager.modules.contains { $0.isJellyfin }
+    }
+
+    private var jellyfinPromoCard: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 12) {
+                Image(systemName: "server.rack")
+                    .font(.title2)
+                    .foregroundStyle(Color.primary)
+                    .frame(width: 44, height: 44)
+                    .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Connect Jellyfin")
+                        .font(.headline)
+                    Text("Stream your own Jellyfin server — browse your library, resume where you left off, and sync watch state back.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            HStack(spacing: 8) {
+                Text(jellyfinModuleURL)
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Spacer(minLength: 8)
+                Button {
+                    copyJellyfinURL()
+                } label: {
+                    Image(systemName: "doc.on.doc")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+
+            Button {
+                addJellyfinModule()
+            } label: {
+                HStack {
+                    Spacer()
+                    if isAddingJellyfinModule {
+                        ProgressView().scaleEffect(0.8)
+                    } else {
+                        Label("Add Module", systemImage: "plus.circle.fill")
+                            .font(.subheadline.weight(.semibold))
+                            .foregroundStyle(Color.primary)
+                    }
+                    Spacer()
+                }
+                .padding(.vertical, 10)
+                .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+            }
+            .buttonStyle(.plain)
+            .disabled(isAddingJellyfinModule)
+        }
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .padding(.horizontal, 16)
+        .padding(.vertical, 8)
+    }
+
+    // MARK: - Error Banner
+    private func errorBanner(_ error: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(Color.red)   // Error remains red for clarity
+            Text(error)
+                .font(.subheadline)
+                .foregroundStyle(Color.red)
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        #if os(iOS)
+        .background(Color(.secondarySystemGroupedBackground), in: RoundedRectangle(cornerRadius: 12))
+        #elseif os(tvOS)
+        // TODO: add back background color
+        #else
+        .background(Color(.controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
+        #endif
+        .padding(.horizontal, 16)
+        .padding(.vertical, 4)
+    }
+
+    // MARK: - Built-in Provider Row
+    private func builtInProviderRow(_ type: ProviderType) -> some View {
+        let isChosen = providerManager.orderedProviders.first?.providerType == type
+        let isSelected = moduleManager.activeModule == nil
+        let isDown = isChosen && providerManager.fallbackActive
+
+        return Button {
+            if moduleManager.activeModule != nil {
+                moduleManager.deselectModule()
+            }
+            providerManager.selectProvider(type)
+            #if os(iOS)
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            #endif
+        } label: {
+            HStack(spacing: 14) {
+                AsyncImage(url: URL(string: type.iconURL)) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().aspectRatio(contentMode: .fit)
+                    case .failure, .empty:
+                        Image(systemName: "list.bullet")
+                            .font(.title2)
+                            .foregroundStyle(Color.primary)
+                    @unknown default:
+                        Image(systemName: "list.bullet")
+                            .font(.title2)
+                            .foregroundStyle(Color.primary)
+                    }
+                }
+                .frame(width: 44, height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .background(Color.primary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(type.displayName).font(.headline)
+                    HStack(spacing: 6) {
+                        Text("Built-in · anime metadata")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        if isDown {
+                            Text("Unavailable")
+                                .font(.caption2.weight(.semibold))
+                                .foregroundStyle(.red)
+                                .padding(.horizontal, 6).padding(.vertical, 2)
+                                .background(.red.opacity(0.12), in: Capsule())
+                        }
+                    }
+                }
+                Spacer()
+                if isSelected && isChosen && !isDown {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.primary)
+                        .font(.title3)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(
+                (isSelected && isChosen) ? Color.primary.opacity(0.08) : Color.black.opacity(0.001),
+                in: RoundedRectangle(cornerRadius: 12)
+            )
+            .opacity(isDown ? 0.45 : 1.0)
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.2), value: isSelected)
+        .animation(.easeOut(duration: 0.2), value: providerManager.fallbackActive)
+    }
+
+    // MARK: - Module Row
+    private func moduleRow(_ module: ModuleDefinition) -> some View {
+        let isActive = moduleManager.activeModule?.id == module.id
+        return Button {
+            if !isActive {
+                moduleManager.selectModule(module)
+                #if os(iOS)
+                UIImpactFeedbackGenerator(style: .light).impactOccurred()
+                #endif
+            }
+        } label: {
+            HStack(spacing: 14) {
+                Group {
+                    CachedAsyncImage(urlString: module.iconUrl ?? "", base64String: module.iconData)
+                        .frame(width: 44, height: 44)
+                        .clipShape(RoundedRectangle(cornerRadius: 10))
+                        .background(Color.secondary.opacity(0.1), in: RoundedRectangle(cornerRadius: 10))
+                }
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(module.sourceName).font(.headline)
+                    HStack(spacing: 6) {
+                        Text("v\(module.version)").font(.caption).foregroundStyle(.secondary)
+                        if let author = module.author, !author.name.isEmpty {
+                            Text("·").font(.caption).foregroundStyle(.secondary)
+                            Text(author.name).font(.caption).foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Spacer()
+                if isActive {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(Color.primary)
+                        .font(.title3)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+            .background(isActive ? Color.primary.opacity(0.08) : Color.black.opacity(0.001), in: RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+        .contentShape(Rectangle())
+        .animation(.easeOut(duration: 0.2), value: isActive)
+    }
+
+    // MARK: - Empty State
+    private var emptyModulesView: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "puzzlepiece.extension")
+                .font(.system(size: 32))
+                .foregroundStyle(.tertiary)
+            Text("No modules installed")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Text("Paste a module JSON URL above to get started.")
+                .font(.caption)
+                .foregroundStyle(.tertiary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 24)
+        .padding(.horizontal, 16)
+        .background(Color.clear)
+    }
+
+    // MARK: - Actions
+    /// Copy / share actions for an installed module, so a source can be passed to someone else
+    /// without them hunting down the original link.
+    ///
+    /// Shares `jsonUrl` — the manifest URL `ModuleManager.addModule(from:)` records at install
+    /// time, and the one the recipient can paste straight back into "Add from URL". `scriptUrl`
+    /// is the raw JS and is not installable, so it is deliberately not offered.
+    @ViewBuilder
+    private func shareModuleActions(_ module: ModuleDefinition) -> some View {
+        #if os(tvOS)
+        EmptyView()
+        #else
+        if let link = module.jsonUrl, !link.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            Button {
+                Clipboard.copy(link)
+                #if os(iOS)
+                ToastManager.shared.show(message: "Module link copied", type: .info)
+                #endif
+            } label: {
+                Label("Copy Link", systemImage: "link")
+            }
+            if #available(iOS 16.0, macOS 13.0, *), let url = URL(string: link) {
+                ShareLink(item: url) {
+                    Label("Share Module", systemImage: "square.and.arrow.up")
+                }
+            }
+        }
+        #endif
+    }
+
+    private func addModule() {
+        let trimmedURL = moduleURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedURL.isEmpty, let url = URL(string: trimmedURL) else {
+            addModuleError = "Invalid URL"
+            #if os(iOS)
+            UINotificationFeedbackGenerator().notificationOccurred(.error)
+            #endif
+            return
+        }
+
+        withAnimation {
+            addModuleError = nil
+            isAddingModule = true
+        }
+
+        Task {
+            await moduleManager.addModule(from: url)
+
+            await MainActor.run {
+                withAnimation {
+                    isAddingModule = false
+                    if moduleManager.errorMessage == nil {
+                        moduleURL = ""
+                        isTextFieldFocused = false
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        #endif
+                    } else {
+                        addModuleError = moduleManager.errorMessage
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        #endif
+                    }
+                }
+            }
+        }
+    }
+
+    private func copyLocalFilesURL() {
+        #if os(iOS)
+        UIPasteboard.general.string = localFilesModuleURL
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(localFilesModuleURL, forType: .string)
+        #endif
+    }
+
+    private func addLocalFilesModule() {
+        guard let url = URL(string: localFilesModuleURL) else {
+            addModuleError = "Invalid URL"
+            return
+        }
+        withAnimation {
+            addModuleError = nil
+            moduleManager.errorMessage = nil
+            isAddingLocalModule = true
+        }
+        Task {
+            await moduleManager.addModule(from: url)
+
+            await MainActor.run {
+                withAnimation {
+                    isAddingLocalModule = false
+                    if moduleManager.errorMessage == nil {
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        #endif
+                    } else {
+                        addModuleError = moduleManager.errorMessage
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        #endif
+                    }
+                }
+            }
+        }
+    }
+
+    private func copyJellyfinURL() {
+        #if os(iOS)
+        UIPasteboard.general.string = jellyfinModuleURL
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        #elseif os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(jellyfinModuleURL, forType: .string)
+        #endif
+    }
+
+    private func addJellyfinModule() {
+        guard let url = URL(string: jellyfinModuleURL) else {
+            addModuleError = "Invalid URL"
+            return
+        }
+        withAnimation {
+            addModuleError = nil
+            moduleManager.errorMessage = nil
+            isAddingJellyfinModule = true
+        }
+        Task {
+            await moduleManager.addModule(from: url)
+
+            await MainActor.run {
+                withAnimation {
+                    isAddingJellyfinModule = false
+                    if moduleManager.errorMessage == nil {
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.success)
+                        #endif
+                    } else {
+                        addModuleError = moduleManager.errorMessage
+                        #if os(iOS)
+                        UINotificationFeedbackGenerator().notificationOccurred(.error)
+                        #endif
+                    }
+                }
+            }
+        }
+    }
+
+    private func removeModule(_ module: ModuleDefinition) {
+        moduleManager.removeModule(module)
+        #if os(iOS)
+        UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+        #endif
+    }
+}

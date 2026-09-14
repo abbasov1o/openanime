@@ -1,0 +1,426 @@
+import SwiftUI
+#if os(iOS)
+import UIKit
+import AVFoundation
+#if canImport(GoogleCast)
+import GoogleCast
+#endif
+
+class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        configureAudioSession()
+        configureURLSession()
+        IDMappingService.shared.prefetchAllMappingsIfNeeded()
+        #if os(iOS)
+        DownloadManager.shared.reconnectPendingTasks()
+        #endif
+        application.shortcutItems = QuickAction.registeredItems
+        return true
+    }
+
+    func application(_ application: UIApplication,
+                     configurationForConnecting connectingSceneSession: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        if let shortcutItem = options.shortcutItem {
+            let action = QuickAction(shortcutItem)
+            MainActor.assumeIsolated {
+                QuickActionManager.shared.pending = action
+            }
+        }
+        let config = UISceneConfiguration(name: connectingSceneSession.configuration.name,
+                                          sessionRole: connectingSceneSession.role)
+        config.delegateClass = SceneDelegate.self
+        return config
+    }
+
+    func applicationWillTerminate(_ application: UIApplication) {
+        #if !targetEnvironment(macCatalyst) || os(macOS) && canImport(GoogleCast)
+        let bgTask = application.beginBackgroundTask { }
+        Task { @MainActor in
+            CastManager.shared.stopCasting()
+            application.endBackgroundTask(bgTask)
+        }
+        // Small sleep to give the network request a chance to fire before the process is killed
+        Thread.sleep(forTimeInterval: 0.5)
+        #endif
+    }
+
+    func application(_ application: UIApplication, handleEventsForBackgroundURLSession identifier: String, completionHandler: @escaping () -> Void) {
+        #if os(iOS)
+        DownloadManager.shared.handleBackgroundEvents(identifier: identifier, completionHandler: completionHandler)
+        #endif
+    }
+
+    func application(_ application: UIApplication, supportedInterfaceOrientationsFor window: UIWindow?) -> UIInterfaceOrientationMask {
+        #if targetEnvironment(macCatalyst) || os(macOS)
+        return .all
+        #elseif os(iOS)
+        if UIDevice.current.userInterfaceIdiom == .pad {
+            return .all
+        }
+        return PlayerPresenter.shared.orientationLock
+        #else
+        return .all
+        #endif
+    }
+
+    private func configureAudioSession() {
+        do {
+            let audioSession = AVAudioSession.sharedInstance()
+            // Declare the category at launch (harmless — does NOT interrupt other
+            // apps' audio). Activation is deferred to player open so system music
+            // (Spotify/Apple Music) keeps playing while browsing the app.
+            try audioSession.setCategory(.playback, mode: .moviePlayback)
+        } catch {
+            Logger.shared.log("Failed to configure audio session: \(error)", type: "Error")
+        }
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        // Background execution during a cast is held by BackgroundKeepAlive (the `audio`
+        // exemption) and CastProxyServer's own assertion, both scoped to an actual session.
+        //
+        // What used to be here took an unconditional assertion on every backgrounding with
+        // an EMPTY expiration handler and ended it 27s later on a timer. An assertion whose
+        // handler doesn't end it is a watchdog termination if it ever expires first, and
+        // taking one when nothing is casting just burns the app's budget.
+    }
+
+    private func configureURLSession() {
+        let config = URLSessionConfiguration.default
+        // Allow network transfers in background
+        config.waitsForConnectivity = true
+        config.shouldUseExtendedBackgroundIdleMode = true
+        config.timeoutIntervalForRequest = 60
+        config.timeoutIntervalForResource = 3600
+        // Create a default session with this config for general use
+        _ = URLSession(configuration: config)
+    }
+}
+#endif
+
+@main
+struct ShiroxApp: App {
+#if os(iOS)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
+#endif
+    @StateObject private var moduleManager = ModuleManager.shared
+    @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
+    /// Shown on every cold start, not just the first — the system launch screen is blank, so
+    /// without this the app opens on nothing and then snaps to content.
+    @State private var showSplash = true
+    @State private var showOnboarding = false
+    @Environment(\.scenePhase) private var scenePhase
+
+    init() {
+        KingfisherImageCache.configure()
+        URLCache.shared = URLCache(
+            memoryCapacity: 20 * 1024 * 1024,
+            diskCapacity: 150 * 1024 * 1024,
+            diskPath: nil
+        )
+        #if !os(tvOS) && !targetEnvironment(macCatalyst) || os(macOS)
+            _ = CastManager.shared
+        #endif
+        // AniList and MyAnimeList are disabled in this build: Anizium is the only
+        // registered provider, so every ProviderManager route lands there.
+        ProviderManager.shared.setup(providers: [AniziumProvider.shared])
+        // Anyone who already has the app set up has effectively finished onboarding; don't
+        // interrupt an existing install to tell it how to do what it is already doing.
+        // The embedded Anizium module doesn't count as a "set up" source here, or this
+        // would skip onboarding for brand-new installs too.
+        if !UserDefaults.standard.bool(forKey: "hasCompletedOnboarding"),
+           ModuleManager.shared.modules.contains(where: { $0.id != AniziumEmbeddedModule.scriptURL }) {
+            UserDefaults.standard.set(true, forKey: "hasCompletedOnboarding")
+        }
+        PendingWriteQueue.shared.register(sink: LibraryWriteSink())
+        LocalLibraryManager.shared.syncFromContinueWatching()
+        HostBlocklist.shared.loadIfNeeded()
+    }
+
+    var body: some Scene {
+        WindowGroup {
+            RootTabView()
+                .environmentObject(moduleManager)
+                .tint(.primary)
+                // First run: the app ships with no sources, so every tab is empty until one is
+                // connected. Onboarding says so and wires up the two things that fix it.
+                //
+                // Driven by plain state rather than a binding computed from the stored flag.
+                // SwiftUI calls a presentation binding's setter with `false` whenever the cover
+                // isn't showing, and a setter that wrote "finished" on that marked onboarding
+                // complete before it had ever been seen.
+                .fullScreenCoverCompat(isPresented: $showOnboarding) {
+                    OnboardingView()
+                        .environmentObject(moduleManager)
+                }
+                .overlay {
+                    if showSplash { SplashView(isPresented: $showSplash) }
+                }
+                .onChangeOf(showSplash) { stillShowing in
+                    // Decide once, after the splash hands over: presenting a cover underneath
+                    // it would just be revealed by the fade instead of arriving on its own.
+                    guard !stillShowing else { return }
+                    showOnboarding = !hasCompletedOnboarding
+                }
+                .onChange(of: scenePhase) { phase in
+                    if phase == .active { Task { await PendingWriteQueue.shared.flush() } }
+                }
+        }
+        #if targetEnvironment(macCatalyst) || os(macOS)
+        .commands {
+            CommandGroup(replacing: .appSettings) {
+                Button("Settings") {
+                    NotificationCenter.default.post(name: .openSettingsTab, object: nil)
+                }
+                .keyboardShortcut(",", modifiers: .command)
+            }
+        }
+        #endif
+    }
+}
+
+#if targetEnvironment(macCatalyst) || os(macOS)
+enum SidebarTab: CaseIterable {
+    case home, library, downloads, settings, search
+
+    var label: String {
+        switch self {
+        case .home:      return "Home"
+        case .library:   return "Library"
+        case .downloads: return "Downloads"
+        case .settings:  return "Settings"
+        case .search:    return "Search"
+        }
+    }
+
+    var icon: String {
+        switch self {
+        case .home:      return "house.fill"
+        case .library:   return "books.vertical.fill"
+        case .downloads: return "arrow.down.circle.fill"
+        case .settings:  return "gearshape.fill"
+        case .search:    return "magnifyingglass"
+        }
+    }
+}
+
+private struct MacSidebarRow: View {
+    let tab: SidebarTab
+    let isSelected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: tab.icon)
+                    .font(.system(size: 20))
+                    .frame(width: 24)
+                Text(tab.label)
+                    .font(.body.weight(.medium))
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 9)
+            .foregroundStyle(isSelected ? .white : .secondary)
+            .background(
+                Capsule()
+                    .fill(isSelected ? Color.primary : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct MacSidebarView: View {
+    @Binding var selection: SidebarTab
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Shirox")
+                .font(.title2.bold())
+                .padding(.horizontal, 16)
+                .padding(.top, 20)
+                .padding(.bottom, 12)
+
+            ForEach(SidebarTab.allCases, id: \.self) { tab in
+                MacSidebarRow(tab: tab, isSelected: selection == tab) {
+                    selection = tab
+                }
+                .padding(.horizontal, 8)
+            }
+
+            Spacer()
+        }
+        .navigationSplitViewColumnWidthIfAvailable(220)
+    }
+}
+#endif
+
+// MARK: - Root Tab View
+
+private struct RootTabView: View {
+    @EnvironmentObject private var moduleManager: ModuleManager
+    @ObservedObject private var cfManager = CloudflareBypassManager.shared
+    #if os(iOS)
+    @ObservedObject private var playerPresenter = PlayerPresenter.shared
+    @ObservedObject private var quickActions = QuickActionManager.shared
+    #endif
+    @State private var selectedTab = 0
+    #if targetEnvironment(macCatalyst) || os(macOS)
+    @State private var sidebarTab: SidebarTab = .home
+    #endif
+
+    #if os(iOS)
+    private func routePendingQuickAction() {
+        guard let action = quickActions.pending else { return }
+        switch action {
+        case .library:   selectedTab = 1
+        case .downloads: selectedTab = 2
+        case .search:    selectedTab = 4
+        }
+        quickActions.pending = nil
+    }
+    #endif
+
+    var body: some View {
+        Group {
+            if #available(iOS 18, macOS 15, *) {
+                #if targetEnvironment(macCatalyst)
+                NavigationSplitView {
+                    MacSidebarView(selection: $sidebarTab)
+                } detail: {
+                    switch sidebarTab {
+                    case .home:      HomeView()
+                    case .library:   LibraryView()
+                    case .downloads: DownloadsView()
+                    case .settings:  SettingsView()
+                    case .search:    SearchView()
+                    }
+                }
+                #elseif os(macOS)
+                    NavigationSplitView {
+                        MacSidebarView(selection: $sidebarTab)
+                    } detail: {
+                        switch sidebarTab {
+                        case .home:      HomeView()
+                        case .library:   LibraryView()
+                        case .settings:  SettingsView()
+                        case .search:    SearchView()
+                        default: EmptyView()
+                        }
+                    }
+                #else
+                TabView(selection: $selectedTab) {
+                    Tab("Home", systemImage: "house.fill", value: 0) {
+                        HomeView()
+                    }
+                    Tab("Library", systemImage: "books.vertical.fill", value: 1) {
+                        LibraryView()
+                    }
+                    #if os(iOS)
+                    Tab("Downloads", systemImage: "arrow.down.circle.fill", value: 2) {
+                        DownloadsView()
+                    }
+                    #endif
+                    Tab("Settings", systemImage: "gearshape.fill", value: 3) {
+                        SettingsView()
+                    }
+                    Tab(value: 4, role: .search) {
+                        SearchView()
+                    }
+                }
+                .tabViewStyle(.sidebarAdaptable)
+                .tint(.primary)
+                #endif
+            } else {
+                TabView(selection: $selectedTab) {
+                    HomeView()
+                        .tabItem { Label("Home", systemImage: "house.fill") }
+                        .tag(0)
+                    LibraryView()
+                        .tabItem { Label("Library", systemImage: "books.vertical.fill") }
+                        .tag(1)
+                    #if os(iOS)
+                    DownloadsView()
+                        .tabItem { Label("Downloads", systemImage: "arrow.down.circle.fill") }
+                        .tag(2)
+                    #endif
+                    SettingsView()
+                        .tabItem { Label("Settings", systemImage: "gearshape.fill") }
+                        .tag(3)
+                    SearchView()
+                        .tabItem { Label("Search", systemImage: "magnifyingglass") }
+                        .tag(4)
+                }
+                .tint(.primary)
+            }
+        }
+        .onOpenURL { url in
+            guard url.scheme == "shirox" else { return }
+            AniListAuthManager.shared.handleCallback(url: url)
+        }
+        .task {
+            await moduleManager.restoreActiveModule()
+            await moduleManager.checkForUpdates()
+            await AniziumAuthManager.shared.restoreSession()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .openSettingsTab)) { _ in
+            #if targetEnvironment(macCatalyst)
+            sidebarTab = .settings
+            #else
+            selectedTab = 3
+            #endif
+        }
+        #if os(iOS)
+        .onAppear { routePendingQuickAction() }
+        .onChange(of: quickActions.pending) { _ in routePendingQuickAction() }
+        #endif
+        #if os(iOS)
+        .sheet(isPresented: Binding(
+            get: { playerPresenter.pendingRatingContext != nil },
+            set: { if !$0 { playerPresenter.pendingRatingContext = nil } }
+        )) {
+            if let ctx = playerPresenter.pendingRatingContext {
+                RatingPromptView(
+                    title: ctx.mediaTitle,
+                    imageUrl: ctx.imageUrl,
+                    scoreFormat: AniListAuthManager.shared.scoreFormat,
+                    onSave: { score in
+                        PlayerPresenter.shared.submitRating(score, for: ctx)
+                        playerPresenter.pendingRatingContext = nil
+                    },
+                    onSkip: {
+                        playerPresenter.pendingRatingContext = nil
+                    }
+                )
+                .adaptivePresentationDetents([.medium, .large])
+            }
+        }
+
+        .overlay(alignment: .bottom) {
+            ToastView()
+                .allowsHitTesting(false)
+        }
+
+        .onChange(of: cfManager.activeBypassWebView != nil) { presented in
+            if presented {
+                CloudflareBypassWindowController.shared.show()
+            } else {
+                CloudflareBypassWindowController.shared.hide()
+            }
+        }
+        #endif
+        #if targetEnvironment(macCatalyst)
+        .onAppear {
+            guard let scene = UIApplication.shared.connectedScenes.first as? UIWindowScene else { return }
+            scene.sizeRestrictions?.minimumSize = CGSize(width: 1024, height: 700)
+        }
+        #endif
+    }
+}
+
+extension Notification.Name {
+    static let openSettingsTab = Notification.Name("OpenSettingsTab")
+}

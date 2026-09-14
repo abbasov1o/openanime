@@ -1,0 +1,1120 @@
+import SwiftUI
+
+enum LibrarySortOrder: String, CaseIterable, Identifiable {
+    case score      = "My Rating"
+    case updated    = "Last Updated"
+    case progress   = "Progress"
+    case title      = "Title"
+
+    var id: String { rawValue }
+}
+
+struct LibraryView: View {
+    @StateObject private var vm = LibraryViewModel()
+    @ObservedObject private var anilistAuth = AniListAuthManager.shared
+    @ObservedObject private var malAuth = MALAuthManager.shared
+    @ObservedObject private var providerManager = ProviderManager.shared
+    @State private var showProfile = false
+    @State private var showNotifications = false
+    @StateObject private var profileVM = ProfileViewModel()
+    @State private var searchText = ""
+    @AppStorage("librarySortOrder") private var sortOrderRaw: String = LibrarySortOrder.score.rawValue
+    @AppStorage("librarySortAscending") private var sortAscending = false
+    @AppStorage("localScoreFormat") private var localScoreFormatRaw: String = ScoreFormat.point10Decimal.rawValue
+
+    #if os(iOS)
+        private let toolbarItemPlacement: [ToolbarItemPlacement] = [ToolbarItemPlacement.topBarLeading, ToolbarItemPlacement.topBarTrailing]
+    #else
+        // TDOO: fix toolbar placement
+        private let toolbarItemPlacement: [ToolbarItemPlacement] = [ToolbarItemPlacement.automatic, ToolbarItemPlacement.automatic]
+    #endif
+
+    private var sortOrder: LibrarySortOrder {
+        LibrarySortOrder(rawValue: sortOrderRaw) ?? .score
+    }
+    @AppStorage("dualSync") private var dualSync = false
+    @State private var selectedGenres: Set<String> = []
+    @State private var selectedEntry: LibraryEntry? = nil
+    @State private var pendingEntry: LibraryEntry? = nil
+    @State private var showProviderPicker = false
+    @State private var showManageCollections = false
+    @State private var otherEntry: LibraryEntry? = nil
+    @State private var otherMedia: Media? = nil
+    @State private var showOtherSheet = false
+    @State private var isLoadingOtherEntry = false
+    // Manga navigation: provider-synced rows resolve to a module asynchronously,
+    // so manga taps drive a programmatic NavigationLink rather than an eager one.
+    @State private var pendingMangaItem: SearchItem? = nil
+    @State private var mangaLinkActive = false
+    @State private var resolvingMangaId: Int? = nil
+    @State private var pendingAniListMangaMedia: Media? = nil
+    @State private var aniListMangaLinkActive = false
+    @State private var showAniziumLogin = false
+    #if os(iOS)
+    @State private var presentationWindow: UIWindow?
+    #endif
+
+    @AppStorage("libraryStatusOrder") private var statusOrderRaw: String = MediaListStatus.allCases.map(\.rawValue).joined(separator: ",")
+
+    /// The account the library UI should present right now: the provider whose list is on
+    /// screen, or — when that one isn't signed in — whichever one is.
+    private var activeProviderType: ProviderType {
+        // Follows the library actually on screen, which is `vm.source` — deliberately fetched
+        // provider-direct, so it never falls back to the other service the way content
+        // elsewhere does.
+        //
+        // It used to switch to `fallback` whenever `ProviderManager.fallbackActive` was set,
+        // which is a global flag any *other* call can raise — Home falling back during an
+        // AniList outage, for instance. The Library's list stayed on the provider you picked
+        // while its toolbar flipped to the other account, so selecting AniList showed the
+        // AniList library under a MyAnimeList avatar and username.
+        let nominal: ProviderType = {
+            if case .provider(let source) = vm.source { return source }
+            return providerManager.primary?.providerType ?? .anilist
+        }()
+
+        // A provider you aren't signed into can't drive the account UI — the username, the
+        // avatar, the notifications bell, the Sign In button. Being signed into AniList while
+        // MyAnimeList was the active provider made the toolbar offer a sign-in for an account
+        // that *was* already connected, just not the one this happened to be pointed at.
+        if !isSignedIn(nominal),
+           let signedIn = ProviderType.userProviders.first(where: { isSignedIn($0) }) {
+            return signedIn
+        }
+        return nominal
+    }
+
+    private var isActiveProviderAuthenticated: Bool {
+        switch activeProviderType {
+        case .anilist: return anilistAuth.isLoggedIn
+        case .mal:     return malAuth.isLoggedIn
+        case .anizium: return AniziumAuthManager.shared.isLoggedIn
+        case .local:   return false
+        }
+    }
+
+    private var scoreFormat: ScoreFormat {
+        if vm.isLocal { return ScoreFormat(rawValue: localScoreFormatRaw) ?? .point10Decimal }
+        switch activeProviderType {
+        case .anilist: return anilistAuth.scoreFormat
+        case .mal, .anizium: return .point10
+        case .local:   return ScoreFormat(rawValue: localScoreFormatRaw) ?? .point10Decimal
+        }
+    }
+
+    private var displayUsername: String {
+        let name: String
+        switch activeProviderType {
+        case .anilist: name = anilistAuth.username ?? "Profile"
+        case .mal:     name = malAuth.username ?? "Profile"
+        case .anizium: name = AniziumAuthManager.shared.user?.nick ?? "Profile"
+        case .local:   name = "Profile"
+        }
+        return name.count > 15 ? String(name.prefix(15)) + "…" : name
+    }
+
+    private var activeAvatarURL: String? {
+        switch activeProviderType {
+        case .anilist: return anilistAuth.avatarURL
+        case .mal:     return malAuth.avatarURL
+        case .anizium:
+            let auth = AniziumAuthManager.shared
+            return auth.profiles.first { $0.ID == auth.selectedProfileID }?.avatarLink
+                ?? auth.profiles.first?.avatarLink
+        case .local:   return nil
+        }
+    }
+
+    private var orderedStatuses: [MediaListStatus] {
+        let saved = statusOrderRaw.components(separatedBy: ",").compactMap(MediaListStatus.init(rawValue:))
+        let missing = MediaListStatus.allCases.filter { !saved.contains($0) }
+        return saved + missing
+    }
+
+    private var availableGenres: [String] {
+        var seen = Set<Int>()
+        let entries = vm.entries.filter { seen.insert($0.media.id).inserted }
+        var genres = Set<String>()
+        for entry in entries {
+            for genre in (entry.media.genres ?? []) { genres.insert(genre) }
+        }
+        return genres.sorted()
+    }
+
+    private var displayedEntries: [LibraryEntry] {
+        var seen = Set<Int>()
+        var entries = vm.entries.filter { seen.insert($0.media.id).inserted }
+        if !searchText.isEmpty {
+            let q = searchText.lowercased()
+            entries = entries.filter {
+                ($0.media.title.english?.lowercased().contains(q) ?? false) ||
+                ($0.media.title.romaji?.lowercased().contains(q) ?? false)
+            }
+        }
+        if !selectedGenres.isEmpty {
+            entries = entries.filter { entry in
+                let genres = Set(entry.media.genres ?? [])
+                return !selectedGenres.isDisjoint(with: genres)
+            }
+        }
+        entries.sort {
+            switch sortOrder {
+            case .title:
+                let a = $0.media.title.displayTitle.lowercased()
+                let b = $1.media.title.displayTitle.lowercased()
+                return sortAscending ? a < b : a > b
+            case .progress:
+                return sortAscending ? $0.progress < $1.progress : $0.progress > $1.progress
+            case .score:
+                let a = $0.displayScore(in: scoreFormat)
+                let b = $1.displayScore(in: scoreFormat)
+                return sortAscending ? a < b : a > b
+            case .updated:
+                let a = $0.updatedAt ?? 0
+                let b = $1.updatedAt ?? 0
+                return sortAscending ? a < b : a > b
+            }
+        }
+        return entries
+    }
+
+    var body: some View {
+        // `libraryContent` is the single, always-present NavigationStack child so the
+        // `.searchable` bar stays attached to the navigation bar across push/pop (matching
+        // the working SearchView pattern). Logged-out users default to the local source, so
+        // there's always something to show; sign-in lives in the toolbar + Settings.
+        NavigationStack {
+            libraryContent
+        }
+        .sheet(isPresented: $showAniziumLogin) {
+            AniziumLoginView()
+        }
+    }
+
+    // MARK: - Sort menu
+
+    private var sortMenu: some View {
+        Menu {
+            Section("Sort by") {
+                ForEach(LibrarySortOrder.allCases) { order in
+                    Button {
+                        if sortOrder == order { sortAscending.toggle() }
+                        else { sortOrderRaw = order.rawValue; sortAscending = false }
+                    } label: {
+                        HStack {
+                            Text(order.rawValue)
+                            if sortOrder == order {
+                                Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                            }
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.subheadline)
+                Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                    .font(.caption)
+            }
+        }
+    }
+
+    // MARK: - Profile unavailable
+
+    /// Shown when an account is signed in but its profile never arrived.
+    ///
+    /// The name, avatar and user id come only from `fetchViewer`, which needs the API — so
+    /// signing in while AniList has its API switched off leaves a session with no identity
+    /// attached to it. The toolbar then reads "Profile" with no picture, and this sheet used to
+    /// have no branch for the case at all, so it opened completely empty and looked broken.
+    private var profileUnavailable: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .font(.system(size: 48))
+                .foregroundStyle(.secondary)
+            Text("Profile unavailable")
+                .font(.headline)
+            Text("You're signed in, but \(activeProviderType.displayName) hasn't sent your profile yet. This usually means its API is down — your account is fine, and it'll fill in once the service is reachable.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Button("Try Again") {
+                Task { await AniListAuthManager.shared.fetchViewer() }
+            }
+            .font(.subheadline.weight(.semibold))
+        }
+        .padding()
+    }
+
+    // MARK: - Sign in
+
+    /// Both trackers, offered explicitly.
+    ///
+    /// Signing in used to go to whichever provider the library happened to be pointed at, with
+    /// no way to say you meant the other one — so someone who wanted MyAnimeList while AniList
+    /// was active had nowhere to say so. Signing in already re-points the library at that
+    /// provider (see the `isLoggedIn` handlers below), so picking one here is the whole action.
+    @ViewBuilder
+    private var signInMenuItems: some View {
+        ForEach(ProviderType.userProviders, id: \.self) { type in
+            Button {
+                signIn(to: type)
+            } label: {
+                // An account that's already connected stays listed, so the menu always shows
+                // both — but says so, rather than offering a sign-in that would do nothing.
+                if isSignedIn(type) {
+                    Label("\(type.displayName) — signed in", systemImage: "checkmark")
+                } else {
+                    Text(type.displayName)
+                }
+            }
+            .disabled(isSignedIn(type))
+        }
+    }
+
+    private func isSignedIn(_ type: ProviderType) -> Bool {
+        switch type {
+        case .anilist: return anilistAuth.isLoggedIn
+        case .mal:     return malAuth.isLoggedIn
+        case .anizium: return AniziumAuthManager.shared.isLoggedIn
+        case .local:   return false
+        }
+    }
+
+    private func signIn(to type: ProviderType) {
+        switch type {
+        case .anilist:
+            #if os(iOS)
+            if let window = presentationWindow { anilistAuth.login(presentationAnchor: window) }
+            #endif
+        case .mal:
+            #if os(iOS)
+            if let window = presentationWindow { malAuth.login(presentationAnchor: window) }
+            #endif
+        // Anizium signs in with its own nick/e-mail + password form.
+        case .anizium:
+            showAniziumLogin = true
+        case .local:
+            break
+        }
+    }
+
+    // MARK: - Login prompt
+
+    private var loginPrompt: some View {
+        VStack(spacing: 24) {
+            Spacer()
+            Image(systemName: "books.vertical.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.primary)
+            // Neutral wording now that the button below offers both: naming one service here
+            // while the menu lists two read as though the choice had already been made.
+            Text("Track your anime")
+                .font(.title3.weight(.semibold))
+                .multilineTextAlignment(.center)
+            Text("Sign in to view and manage your anime library.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            Menu {
+                signInMenuItems
+            } label: {
+                HStack(spacing: 6) {
+                    Text("Sign In")
+                    Image(systemName: "chevron.down").font(.subheadline)
+                }
+                .font(.headline)
+                #if os(iOS)
+                    .foregroundStyle(Color(.systemBackground))
+                #else
+                    // TODO: fix missing color ( XCAssets )
+                    .foregroundStyle(Color.secondary)
+                #endif
+                .frame(maxWidth: .infinity)
+                .frame(height: 50)
+                .background(Color.primary, in: Capsule())
+                .padding(.horizontal, 40)
+            }
+            .buttonStyle(.plain)
+            Spacer()
+        }
+        .navigationTitle("Library")
+        #if os(iOS)
+        .onAppear {
+            presentationWindow = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap { $0.windows }
+                .first { $0.isKeyWindow }
+        }
+        #endif
+    }
+
+    // MARK: - Filter menus
+
+    /// Whether the status filter is off its default (default = `.current`, no custom list).
+    private var isStatusFilterActive: Bool {
+        vm.selectedCustomList != nil || vm.selectedStatus != .current
+    }
+
+    /// The status / custom-list picker items (shared by the macOS capsule and the iOS toolbar button).
+    @ViewBuilder
+    private var statusMenuContent: some View {
+        Section("Lists") {
+            ForEach(orderedStatuses) { status in
+                Button {
+                    vm.selectStatus(status)
+                } label: {
+                    HStack {
+                        Text(status.displayName(for: vm.mediaType))
+                        if vm.selectedCustomList == nil && vm.selectedStatus == status {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        }
+        if !vm.customListNames.isEmpty {
+            Section("Custom Lists") {
+                ForEach(vm.customListNames, id: \.self) { name in
+                    Button {
+                        vm.selectCustomList(vm.selectedCustomList == name ? nil : name)
+                    } label: {
+                        HStack {
+                            Label(name, systemImage: "list.star")
+                            if vm.selectedCustomList == name {
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+                if vm.isLocal {
+                    Button {
+                        showManageCollections = true
+                    } label: {
+                        Label("Manage Collections…", systemImage: "folder.badge.gearshape")
+                    }
+                }
+            }
+        }
+    }
+
+    /// The genre picker items (shared by the macOS capsule and the iOS toolbar button).
+    @ViewBuilder
+    private var genreMenuContent: some View {
+        Section("Genres") {
+            if !selectedGenres.isEmpty {
+                Button(role: .destructive) {
+                    selectedGenres.removeAll()
+                } label: {
+                    Label("Clear All Filters", systemImage: "xmark.circle")
+                }
+            }
+            ForEach(availableGenres, id: \.self) { genre in
+                Button {
+                    if selectedGenres.contains(genre) {
+                        selectedGenres.remove(genre)
+                    } else {
+                        selectedGenres.insert(genre)
+                    }
+                } label: {
+                    HStack {
+                        Text(genre)
+                        if selectedGenres.contains(genre) {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// macOS keeps the static switcher + capsule filter row; these wrap the shared menu content.
+    @ViewBuilder
+    private func statusFilterMenu() -> some View {
+        Menu { statusMenuContent } label: {
+            LibraryFilterLabel(
+                systemImage: "line.3.horizontal.decrease",
+                text: vm.selectedCustomList ?? vm.selectedStatus.displayName(for: vm.mediaType),
+                isActive: isStatusFilterActive,
+                collapsed: false
+            )
+        }
+        .menuIndicator(.hidden)
+        .foregroundStyle(.primary)
+        .buttonStyle(.plain)
+    }
+
+    @ViewBuilder
+    private func genreFilterMenu() -> some View {
+        Menu { genreMenuContent } label: {
+            LibraryFilterLabel(
+                systemImage: "tag",
+                text: selectedGenres.isEmpty ? "All Genres" : "\(selectedGenres.count) selected",
+                isActive: !selectedGenres.isEmpty,
+                collapsed: false
+            )
+        }
+        .menuIndicator(.hidden)
+        .foregroundStyle(.primary)
+        .buttonStyle(.plain)
+    }
+
+    /// The capsule filter row (List on the left, Genre on the right) shared by macOS and iOS.
+    @ViewBuilder
+    private var filterCapsuleRow: some View {
+        HStack {
+            statusFilterMenu()
+            Spacer()
+            if !availableGenres.isEmpty {
+                genreFilterMenu()
+            }
+        }
+    }
+
+    /// Anime | Manga capsule pills, matching `LibrarySourceSwitcher`'s pill style.
+    @ViewBuilder private var mediaTypeSegment: some View {
+        HStack(spacing: 8) {
+            mediaTypePill(title: "Anime", systemImage: "tv", kind: .anime)
+            mediaTypePill(title: "Manga", systemImage: "book", kind: .manga)
+            Spacer()
+        }
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private func mediaTypePill(title: String, systemImage: String, kind: MediaKind) -> some View {
+        let selected = vm.mediaType == kind
+        Button { vm.selectMediaType(kind) } label: {
+            HStack(spacing: 6) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 13, weight: .semibold))
+                    .frame(width: 16, height: 16)
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .fixedSize(horizontal: true, vertical: false)
+            .padding(.horizontal, 12).padding(.vertical, 7)
+            .background(Capsule().fill(selected ? Color.primary.opacity(0.12) : Color.secondary.opacity(0.08)))
+            .overlay(Capsule().strokeBorder(selected ? Color.primary.opacity(0.3) : Color.clear, lineWidth: 1))
+            .foregroundStyle(selected ? Color.primary : .secondary)
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Hidden programmatic link for manga rows (module-source rows navigate directly;
+    /// provider-synced rows resolve to a module first). Uses the classic isActive
+    /// NavigationLink so it works with this file's NavigationStack.
+    @ViewBuilder private var mangaNavLink: some View {
+        NavigationLink(
+            destination: Group { if let item = pendingMangaItem { MangaDetailView(item: item) } },
+            isActive: $mangaLinkActive
+        ) { EmptyView() }
+        .hidden()
+    }
+
+    /// Hidden link for provider-synced manga rows: opens the AniList-backed detail
+    /// (which resolves a module itself) so AniList metadata + relations are kept.
+    @ViewBuilder private var aniListMangaNavLink: some View {
+        NavigationLink(
+            destination: Group {
+                if let m = pendingAniListMangaMedia {
+                    AniListMangaDetailView(mediaId: m.id, preloadedMedia: m)
+                }
+            },
+            isActive: $aniListMangaLinkActive
+        ) { EmptyView() }
+        .hidden()
+    }
+
+    private func openManga(_ entry: LibraryEntry) {
+        if let source = entry.localSource, source.kind == .module {
+            pendingMangaItem = SearchItem(
+                title: entry.media.title.displayTitle,
+                image: entry.media.coverImage.thumb ?? "",
+                href: source.detailHref ?? "")
+            mangaLinkActive = true
+        } else {
+            pendingAniListMangaMedia = entry.media
+            aniListMangaLinkActive = true
+        }
+    }
+
+    /// Manga entries: tap opens the reader detail (resolving a module first for
+    /// provider-synced rows); the pencil opens the edit sheet.
+    @ViewBuilder
+    private func mangaRow(_ entry: LibraryEntry) -> some View {
+        LibraryRowView(entry: entry, scoreFormat: scoreFormat) {
+            selectedEntry = entry
+        }
+        .overlay(alignment: .center) {
+            if resolvingMangaId == entry.media.id {
+                ProgressView()
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { openManga(entry) }
+    }
+
+    #if os(iOS)
+    /// True when the scrolling list (rather than a loading / empty / error state) is on screen.
+    private var showsLibraryList: Bool {
+        !vm.isLoading && vm.error == nil && !displayedEntries.isEmpty
+    }
+    #endif
+
+    // MARK: - Toolbar
+
+    @ToolbarContentBuilder
+    private var libraryToolbar: some ToolbarContent {
+        ToolbarItem(placement: toolbarItemPlacement[0]) {
+            sortMenu
+        }
+        ToolbarItem(placement: toolbarItemPlacement[1]) {
+            if isActiveProviderAuthenticated {
+                HStack(spacing: 10) {
+                    if activeProviderType == .anilist {
+                        Button {
+                            anilistAuth.unreadNotificationCount = 0
+                            showNotifications = true
+                        } label: {
+                            Image(systemName: "bell")
+                                .font(.system(size: 17, weight: .medium))
+                                .notificationBadge(count: anilistAuth.unreadNotificationCount)
+                        }
+                        Divider().frame(height: 16)
+                    }
+
+                    Button {
+                        showProfile = true
+                    } label: {
+                        HStack(spacing: 6) {
+                            if let url = activeAvatarURL {
+                                CachedAsyncImage(urlString: url)
+                                    .frame(width: 28, height: 28)
+                                    .clipShape(Circle())
+                            }
+                            Text(displayUsername)
+                                .font(.subheadline.weight(.medium))
+                                .layoutPriority(1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8)
+            } else {
+                Menu {
+                    signInMenuItems
+                } label: {
+                    Text("Sign In")
+                        .font(.subheadline.weight(.semibold))
+                }
+            }
+        }
+    }
+
+    // MARK: - Empty state
+
+    private var emptyStateTitle: LocalizedStringKey {
+        searchText.isEmpty ? "Nothing here yet" : "No Results"
+    }
+
+    private var emptyStateIcon: String {
+        searchText.isEmpty ? "tray" : "magnifyingglass"
+    }
+
+    private var emptyStateDescription: String {
+        let noun = vm.mediaType == .manga ? "manga" : "anime"
+        if !searchText.isEmpty {
+            return "No \(noun) matching \"\(searchText)\"."
+        }
+        let listName = vm.selectedCustomList ?? vm.selectedStatus.displayName(for: vm.mediaType)
+        if vm.isLocal {
+            return "Add \(noun) to \(listName) from any title's detail screen."
+        }
+        return "Add \(noun) to \(listName) on \(activeProviderType == .mal ? "MyAnimeList" : "AniList")."
+    }
+
+    // MARK: - Entries list
+
+    /// Refreshes the AniList unread-notification count when signed in to AniList; no-op otherwise.
+    private func refreshUnreadCountIfNeeded() async {
+        if activeProviderType == .anilist && anilistAuth.isLoggedIn {
+            await anilistAuth.refreshUnreadCount()
+        }
+    }
+
+    @ViewBuilder
+    private func entryRow(_ entry: LibraryEntry) -> some View {
+        Group {
+            if entry.media.isManga {
+                mangaRow(entry)
+            } else if let source = entry.localSource, source.kind == .localFile {
+                localFileRow(entry, source: source)
+            } else {
+                navigableRow(entry)
+            }
+        }
+        .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+        .listRowBackground(Color.clear)
+        #if !os(tvOS)
+        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+            Button {
+                Task {
+                    await vm.update(
+                        entry: entry,
+                        status: entry.status,
+                        progress: entry.progress + 1,
+                        // Pass the score in the active format so the canonical
+                        // value is preserved (not reinterpreted in a new scale).
+                        score: entry.displayScore(in: scoreFormat)
+                    )
+                }
+            } label: {
+                Label(entry.media.isManga ? "+1 CH" : "+1 EP", systemImage: "plus.circle.fill")
+            }
+            .tint(.green)
+        }
+        #endif
+    }
+
+    /// Module-scraped and AniList/MAL entries navigate to a detail screen (branched destination).
+    @ViewBuilder
+    private func navigableRow(_ entry: LibraryEntry) -> some View {
+        ZStack {
+            NavigationLink(destination: rowDestination(entry)) {
+                EmptyView()
+            }
+            .opacity(0)
+
+            LibraryRowView(entry: entry, scoreFormat: scoreFormat) {
+                if !vm.isLocal && anilistAuth.isLoggedIn && malAuth.isLoggedIn && !dualSync {
+                    pendingEntry = entry
+                    showProviderPicker = true
+                } else {
+                    selectedEntry = entry
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func rowDestination(_ entry: LibraryEntry) -> some View {
+        if let source = entry.localSource, source.kind == .module {
+            DetailView(
+                item: SearchItem(
+                    title: entry.media.title.displayTitle,
+                    image: entry.media.coverImage.thumb ?? "",
+                    href: source.detailHref ?? ""
+                ),
+                moduleId: source.moduleId
+            )
+        } else {
+            AniListDetailView(mediaId: entry.media.id, preloadedMedia: entry.media)
+        }
+    }
+
+    /// Local imported files have no detail screen — tapping the row resumes playback.
+    @ViewBuilder
+    private func localFileRow(_ entry: LibraryEntry, source: LocalSource) -> some View {
+        LibraryRowView(entry: entry, scoreFormat: scoreFormat) {
+            selectedEntry = entry   // tap the row content → edit sheet
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { resumeLocalFile(source) }
+    }
+
+    private func resumeLocalFile(_ source: LocalSource) {
+        #if os(iOS)
+        guard let name = source.localImportName else { return }
+        if let url = LocalPlaybackCoordinator.shared.resolveImport(name: name) {
+            LocalPlaybackCoordinator.shared.launch(videoURL: url, subtitle: nil, resumeFrom: 0)
+        } else {
+            ToastManager.shared.show(message: "File moved or unavailable — remove this item", type: .error)
+        }
+        #endif
+    }
+
+    private var entriesList: some View {
+        List {
+            #if os(iOS)
+            LibrarySourceSwitcher(selected: vm.source) { vm.selectSource($0) }
+                .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 6, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            mediaTypeSegment
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 6, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            filterCapsuleRow
+                .listRowInsets(EdgeInsets(top: 0, leading: 16, bottom: 8, trailing: 16))
+                .listRowSeparator(.hidden)
+                .listRowBackground(Color.clear)
+            #endif
+            ForEach(displayedEntries, id: \.media.id) { entry in
+                entryRow(entry)
+            }
+        }
+        .softScrollEdges()
+        .listStyle(.plain)
+        .refreshable {
+            async let count: Void = refreshUnreadCountIfNeeded()
+            await vm.refresh()
+            await count
+        }
+    }
+
+    // MARK: - Library content
+
+    private var libraryContentBase: some View {
+        VStack(spacing: 0) {
+            #if !os(iOS)
+            LibrarySourceSwitcher(selected: vm.source) { vm.selectSource($0) }
+                .padding(.horizontal, 16)
+            mediaTypeSegment
+                .padding(.horizontal, 16)
+                .padding(.top, 6)
+            // Combined row: Status on left, Genres on right
+            filterCapsuleRow
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
+            #else
+            // The source switcher + filter row scroll away as the list's first rows; for the
+            // non-list states (loading / empty / error) they're pinned here so the source and
+            // filters stay usable.
+            if !showsLibraryList {
+                LibrarySourceSwitcher(selected: vm.source) { vm.selectSource($0) }
+                    .padding(.horizontal, 16)
+                    .padding(.top, 4)
+                mediaTypeSegment
+                    .padding(.horizontal, 16)
+                    .padding(.top, 6)
+                filterCapsuleRow
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+            }
+            #endif
+
+            if vm.isLoading {
+                Spacer()
+                ProgressView()
+                Spacer()
+            } else if let error = vm.error {
+                ContentUnavailableView {
+                    Label("Couldn't Load", systemImage: "wifi.slash")
+                } description: {
+                    Text(error)
+                } actions: {
+                    Button("Retry") { Task { await vm.refresh() } }
+                }
+            } else if displayedEntries.isEmpty {
+                ContentUnavailableView(
+                    emptyStateTitle,
+                    systemImage: emptyStateIcon,
+                    description: Text(emptyStateDescription)
+                )
+            } else {
+                entriesList
+            }
+        }
+        .background { mangaNavLink }
+        .background { aniListMangaNavLink }
+        .toolbar { libraryToolbar }
+        .task { await vm.autoRefreshIfNeeded() }
+        #if os(iOS)
+        .onAppear {
+            presentationWindow = UIApplication.shared.connectedScenes
+                .compactMap { $0 as? UIWindowScene }
+                .flatMap { $0.windows }
+                .first { $0.isKeyWindow }
+            Task { await refreshUnreadCountIfNeeded() }
+        }
+        #endif
+        .onChangeOf(anilistAuth.isLoggedIn) { newValue in
+            if newValue { vm.selectSource(.provider(.anilist)) }
+            else if !malAuth.isLoggedIn { vm.selectSource(.local) }
+        }
+        .onChangeOf(malAuth.isLoggedIn) { newValue in
+            if newValue { vm.selectSource(.provider(.mal)) }
+            else if !anilistAuth.isLoggedIn { vm.selectSource(.local) }
+        }
+        .onChangeOf(providerManager.fallbackActive) {
+            Task { await vm.refresh() }
+        }
+        #if os(iOS)
+        .navigationTitle("Library")
+        .navigationBarTitleDisplayMode(.large)
+        .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search library")
+        #else
+        .navigationTitle("Library")
+        .searchable(text: $searchText, prompt: "Search library")
+        #endif
+    }
+
+    private var libraryContent: some View {
+        libraryContentBase
+        .adaptiveSheet(item: $selectedEntry) { entry in
+            LibraryEntryEditSheet(
+                entry: entry,
+                media: entry.media,
+                scoreFormatOverride: vm.isLocal ? scoreFormat : nil,
+                onSave: { status, progress, score in
+                    if status == .completed {
+                        ContinueWatchingManager.shared.resetProgress(
+                            aniListID: entry.media.id, moduleId: nil, mediaTitle: entry.media.title.searchTitle
+                        )
+                    }
+                    Task {
+                        await vm.update(entry: entry, status: status, progress: progress, score: score)
+                        if !vm.isLocal && vm.mediaType != .manga && dualSync && anilistAuth.isLoggedIn && malAuth.isLoggedIn {
+                            if activeProviderType == .anilist, let idMal = entry.media.idMal {
+                                try? await MALProvider.shared.updateEntry(mediaId: idMal, status: status, progress: progress, score: score)
+                            } else if activeProviderType == .mal {
+                                if let aniListId = await IDMappingService.shared.anilistId(forMALId: entry.media.id) {
+                                    try? await AniListProvider.shared.updateEntry(mediaId: aniListId, status: status, progress: progress, score: score)
+                                }
+                            }
+                        }
+                    }
+                },
+                onDelete: {
+                    Task {
+                        await vm.delete(entry: entry)
+                        if !vm.isLocal && vm.mediaType != .manga && dualSync && anilistAuth.isLoggedIn && malAuth.isLoggedIn {
+                            if activeProviderType == .anilist, let idMal = entry.media.idMal {
+                                try? await MALProvider.shared.deleteEntry(entryId: idMal)
+                            } else if activeProviderType == .mal {
+                                if let aniListId = await IDMappingService.shared.anilistId(forMALId: entry.media.id),
+                                   let aniListEntry = try? await AniListProvider.shared.fetchEntry(mediaId: aniListId) {
+                                    try? await AniListProvider.shared.deleteEntry(entryId: aniListEntry.id)
+                                }
+                            }
+                        }
+                    }
+                }
+            )
+        }
+        .confirmationDialog("Edit on which service?", isPresented: $showProviderPicker, titleVisibility: .visible) {
+            Button("Edit on AniList") {
+                guard let entry = pendingEntry else { return }
+                if activeProviderType == .anilist {
+                    selectedEntry = entry
+                } else {
+                    isLoadingOtherEntry = true
+                    Task {
+                        if let aniListId = await IDMappingService.shared.anilistId(forMALId: entry.media.id) {
+                            let fetched = try? await AniListProvider.shared.fetchEntry(mediaId: aniListId)
+                            let aniListMedia = Media(
+                                id: aniListId, idMal: entry.media.id, provider: .anilist,
+                                title: entry.media.title, coverImage: entry.media.coverImage,
+                                bannerImage: nil, description: nil, episodes: entry.media.episodes,
+                                status: nil, averageScore: nil, genres: nil,
+                                season: nil, seasonYear: nil, nextAiringEpisode: nil,
+                                relations: nil, type: nil, format: nil
+                            )
+                            otherEntry = fetched
+                            otherMedia = aniListMedia
+                            showOtherSheet = true
+                        }
+                        isLoadingOtherEntry = false
+                    }
+                }
+            }
+            Button("Edit on MyAnimeList") {
+                guard let entry = pendingEntry else { return }
+                if activeProviderType == .mal {
+                    selectedEntry = entry
+                } else {
+                    guard let idMal = entry.media.idMal else { return }
+                    isLoadingOtherEntry = true
+                    Task {
+                        let fetched = try? await MALProvider.shared.fetchEntry(mediaId: idMal)
+                        let malMedia = Media(
+                            id: idMal, idMal: idMal, provider: .mal,
+                            title: entry.media.title, coverImage: entry.media.coverImage,
+                            bannerImage: nil, description: nil, episodes: entry.media.episodes,
+                            status: nil, averageScore: nil, genres: nil,
+                            season: nil, seasonYear: nil, nextAiringEpisode: nil,
+                            relations: nil, type: nil, format: nil
+                        )
+                        otherEntry = fetched
+                        otherMedia = malMedia
+                        showOtherSheet = true
+                        isLoadingOtherEntry = false
+                    }
+                }
+            }
+            Button("Cancel", role: .cancel) { pendingEntry = nil }
+        }
+        .adaptiveSheet(isPresented: $showOtherSheet) {
+            if let media = otherMedia {
+                LibraryEntryEditSheet(
+                    entry: otherEntry,
+                    media: media,
+                    onSave: { status, progress, score in
+                        Task {
+                            if media.provider == .mal {
+                                try? await MALProvider.shared.updateEntry(mediaId: media.id, status: status, progress: progress, score: score)
+                            } else {
+                                try? await AniListProvider.shared.updateEntry(mediaId: media.id, status: status, progress: progress, score: score)
+                            }
+                        }
+                    },
+                    onDelete: otherEntry != nil ? {
+                        Task {
+                            if media.provider == .mal {
+                                try? await MALProvider.shared.deleteEntry(entryId: media.id)
+                            } else if let entry = otherEntry {
+                                try? await AniListProvider.shared.deleteEntry(entryId: entry.id)
+                            }
+                        }
+                        otherEntry = nil
+                        showOtherSheet = false
+                    } : nil
+                )
+            }
+        }
+        .adaptiveSheet(isPresented: $showProfile) {
+            if activeProviderType == .mal, let uid = malAuth.userId {
+                ProfileView(userId: uid, username: malAuth.username ?? "Profile", avatarURL: malAuth.avatarURL)
+            } else if let uid = anilistAuth.userId, let username = anilistAuth.username {
+                ProfileView(userId: uid, username: username, avatarURL: anilistAuth.avatarURL)
+            } else {
+                profileUnavailable
+            }
+        }
+        .adaptiveSheet(isPresented: $showNotifications) {
+            NotificationsView(vm: profileVM)
+        }
+        .adaptiveSheet(isPresented: $showManageCollections) {
+            ManageCollectionsView()
+        }
+    }
+}
+
+// MARK: - Library row
+
+private struct LibraryRowView: View {
+    let entry: LibraryEntry
+    var scoreFormat: ScoreFormat = .point10Decimal
+    var onEdit: () -> Void = {}
+
+    var body: some View {
+        HStack(spacing: 12) {
+            // Cover image — AniListCardView style
+            Color.clear
+                .aspectRatio(2/3, contentMode: .fit)
+                .frame(width: 70)
+                .overlay(
+                    ZStack {
+                        CachedAsyncImage(urlString: entry.media.coverImage.thumb ?? "")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .clipped()
+
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.5),
+                                .init(color: .black.opacity(0.75), location: 1)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    }
+                )
+                .overlay(alignment: .topTrailing) {
+                    if entry.score > 0 {
+                        HStack(spacing: 2) {
+                            if scoreFormat != .point3 {
+                                Image(systemName: "star.fill").font(.system(size: 7))
+                            }
+                            scoreFormat.scoreText(for: entry.displayScore(in: scoreFormat))
+                                .font(.caption2.weight(.bold))
+                        }
+                        .foregroundStyle(.yellow)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 3)
+                        .background(.black.opacity(0.55), in: Capsule())
+                        .padding(5)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
+
+            // Info
+            VStack(alignment: .leading, spacing: 5) {
+                Text(entry.media.title.displayTitle)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(2)
+
+                Text(progressLabel)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+
+                HStack(spacing: 8) {
+                    if let avg = entry.media.averageScore {
+                        HStack(spacing: 3) {
+                            Image(systemName: "chart.bar.fill")
+                                .font(.system(size: 9))
+                            Text("\(avg)%")
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundStyle(.blue)
+                    }
+                    if entry.score > 0 {
+                        HStack(spacing: 3) {
+                            if scoreFormat != .point3 {
+                                Image(systemName: "star.fill")
+                                    .font(.system(size: 9))
+                            }
+                            scoreFormat.scoreText(for: entry.displayScore(in: scoreFormat))
+                                .font(.caption2.weight(.semibold))
+                        }
+                        .foregroundStyle(.yellow)
+                    }
+                    if let ts = entry.updatedAt {
+                        Text(Date(timeIntervalSince1970: TimeInterval(ts)).formatted(.relative(presentation: .named)))
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+
+                if let genres = entry.media.genres, !genres.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(genres.prefix(2), id: \.self) { g in
+                            Text(g)
+                                .font(.caption2.weight(.medium))
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Color.secondary.opacity(0.15), in: Capsule())
+                        }
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Button { onEdit() } label: {
+                Image(systemName: "pencil.circle.fill")
+                    .font(.system(size: 26))
+                    .foregroundStyle(Color.accentColor)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var progressLabel: String {
+        if entry.media.isManga {
+            if let total = entry.media.episodes {
+                return "\(entry.progress) / \(total) ch"
+            }
+            return "\(entry.progress) ch read"
+        }
+        if let total = entry.media.episodes {
+            return "\(entry.progress) / \(total) episodes"
+        }
+        return "\(entry.progress) episodes watched"
+    }
+}
+

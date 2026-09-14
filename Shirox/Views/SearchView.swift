@@ -1,0 +1,570 @@
+import SwiftUI
+import Combine
+import UniformTypeIdentifiers
+
+struct SearchView: View {
+    @StateObject private var vm = SearchViewModel()
+    @StateObject private var history = SearchHistoryManager()
+    @EnvironmentObject private var moduleManager: ModuleManager
+    @ObservedObject private var providerManager = ProviderManager.shared
+    @State private var showModuleList = false
+    @Environment(\.horizontalSizeClass) private var sizeClass
+    @State private var isLandscape = false
+    // A SINGLE file importer drives both phases. Two `.fileImporter` modifiers in one view
+    // tree collide in SwiftUI (only one ever presents, regardless of separate background
+    // views), so we switch `allowedContentTypes` by phase instead.
+    @State private var showFileImporter = false
+    @State private var importPhase: LocalImportPhase = .video
+    @State private var pendingSubtitle: SubtitleTrack?
+    @State private var addSubtitleUpFront = false
+    // When a subtitle is wanted, the video is picked first and staged (copied) here; it only
+    // plays once a subtitle is chosen or explicitly skipped.
+    @State private var pendingVideoURL: URL?
+    @State private var pendingVideoTitle: String?
+
+    private var isLocalModule: Bool { moduleManager.activeModule?.isLocalPlayback == true }
+    private var isJellyfinModule: Bool { moduleManager.activeModule?.isJellyfin == true }
+
+    private var platformBackground: Color {
+        #if os(iOS)
+        Color(UIColor.systemBackground)
+        #elseif os(tvOS)
+        Color.clear
+        #else
+        Color(NSColor.windowBackgroundColor)
+        #endif
+    }
+
+    private var columnCount: Int {
+        #if os(iOS)
+        guard sizeClass == .regular else { return 2 }
+        return isLandscape ? 5 : 4
+        #else
+        return 4
+        #endif
+    }
+
+    private var columns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: 12), count: columnCount)
+    }
+
+    private var usingModule: Bool { moduleManager.activeModule != nil }
+    private var primaryProvider: ProviderType { providerManager.orderedProviders.first?.providerType ?? .anilist }
+
+    var body: some View {
+        NavigationStack {
+            mainContent
+                .background(SearchActivationObserver { vm.clearResults() })
+                .navigationTitle("Search")
+                .toolbar {
+                    ToolbarItem(placement: .automatic) {
+                        moduleButton
+                    }
+                }
+                .modifier(ConditionalSearchable(enabled: !isLocalModule && !isJellyfinModule, text: $vm.query))
+                .onSubmit(of: .search) {
+                    history.add(vm.query)
+                    vm.search(usingModule: usingModule)
+                }
+                .onChangeOf(vm.query) { new in
+                    if new.isEmpty {
+                        vm.clearResults()
+                    } else if (vm.hasResults || vm.hasSearched) && !vm.isLoading {
+                        vm.clearResults()
+                    }
+                }
+                .onChangeOf(moduleManager.moduleReadyId) { newId in
+                    guard !vm.query.isEmpty, newId != nil else { return }
+                    vm.search(usingModule: true)
+                }
+                .onChangeOf(moduleManager.activeModule) { newModule in
+                    guard !vm.query.isEmpty, newModule == nil else { return }
+                    vm.search(usingModule: false)
+                }
+                .onChangeOf(providerManager.orderedProviders.first?.providerType) {
+                    guard !vm.query.isEmpty, !usingModule else { return }
+                    vm.search(usingModule: false)
+                }
+        }
+        .adaptiveSheet(isPresented: $showModuleList) {
+            NavigationStack {
+                ModuleListView()
+            }
+            .environmentObject(moduleManager)
+            .tint(.primary)
+        }
+        #if os(iOS)
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { isLandscape = geo.size.width > geo.size.height }
+                    .onChangeOf(geo.size) { size in isLandscape = size.width > size.height }
+            }
+        )
+        #endif
+        .onAppear {
+            #if os(iOS)
+            PlayerPresenter.shared.resetToAppOrientation()
+            #endif
+        }
+    }
+
+    // MARK: - Main Content
+    @ViewBuilder
+    private var mainContent: some View {
+        if isJellyfinModule {
+            JellyfinEntryView()
+        } else if isLocalModule {
+            localEntryView
+        } else if !vm.hasResults && !vm.isLoading && !vm.hasSearched {
+            if vm.query.isEmpty && !usingModule {
+                // Nothing typed yet: give people somewhere to go, with any recent searches
+                // carried along at the top. Recents used to be a full-height list of their own,
+                // which meant one previous search hid browsing entirely.
+                SearchBrowseView(
+                    columns: columns,
+                    recentSearches: history.queries,
+                    onSelectRecent: { query in
+                        vm.query = query
+                        history.add(query)
+                        vm.search(usingModule: usingModule)
+                    },
+                    onDeleteRecent: { history.remove($0) },
+                    onClearRecents: { history.clear() }
+                )
+            } else if vm.query.isEmpty && !history.queries.isEmpty {
+                // Module sources have no browse grid, so recents keep their own screen there.
+                historyView
+            } else {
+                emptyStateView(
+                    icon: usingModule ? "puzzlepiece.extension" : "magnifyingglass",
+                    title: usingModule ? "Search via Module" : "Search Anime",
+                    subtitle: usingModule
+                        ? "Searching \(moduleManager.activeModule?.sourceName ?? "")…"
+                        : "Find any anime via \(primaryProvider.displayName)"
+                )
+            }
+        } else if vm.isLoading {
+            loadingView
+        } else if let err = vm.errorMessage {
+            emptyStateView(
+                icon: "exclamationmark.triangle",
+                title: "Something went wrong",
+                subtitle: err
+            )
+        } else if !vm.hasResults && !vm.query.isEmpty {
+            ContentUnavailableView.search(text: vm.query)
+        } else {
+            resultsView
+        }
+    }
+
+    // MARK: - Local Playback Entry
+
+    /// The video is always chosen first. While "Add subtitle file" is on, the first pick stages
+    /// the video and the second pick is the subtitle; otherwise the video plays immediately.
+    /// Driving the button label off this makes each step explicit, so the user always knows
+    /// which file the (otherwise identical-looking) Files picker is asking for.
+    private var needsVideoStep: Bool { pendingVideoURL == nil }
+
+    private var localStepDescription: String {
+        if !needsVideoStep {
+            return "Step 2 of 2 — choose a subtitle file for this video."
+        }
+        return addSubtitleUpFront
+            ? "Step 1 of 2 — choose the video, then you'll add a subtitle."
+            : "Pick a video from Files to play it in Shirox."
+    }
+
+    private var localEntryView: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "folder.badge.plus")
+                .font(.system(size: 52))
+                .foregroundStyle(.secondary)
+            VStack(spacing: 4) {
+                Text("Play a Local File")
+                    .font(.headline)
+                Text(localStepDescription)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+            Toggle("Add subtitle file", isOn: $addSubtitleUpFront)
+                .toggleStyle(.switch)
+                .tint(.secondary)
+                .fixedSize()
+                .disabled(!needsVideoStep)   // locked once a video is staged; clear it to change
+                .onChangeOf(addSubtitleUpFront) { _ in clearStagedVideo() }
+
+            // Feedback: show the staged video (and let the user drop it) before the subtitle step.
+            if let title = pendingVideoTitle {
+                HStack(spacing: 8) {
+                    Image(systemName: "film.fill")
+                        .foregroundStyle(.green)
+                    Text(title)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Button {
+                        clearStagedVideo()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .font(.subheadline)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(Color.secondary.opacity(0.12), in: Capsule())
+            }
+
+            Button {
+                importPhase = needsVideoStep ? .video : .subtitle
+                showFileImporter = true
+            } label: {
+                Label(needsVideoStep ? "Choose video file" : "Choose subtitle file",
+                      systemImage: needsVideoStep ? "play.rectangle.on.rectangle" : "captions.bubble")
+                    .font(.headline)
+                    .foregroundStyle(platformBackground)
+                    .padding(.horizontal, 20)
+                    .padding(.vertical, 12)
+                    .background(Color.primary, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            }
+            .buttonStyle(.plain)
+
+            // On the subtitle step, allow playing the staged video without one.
+            if !needsVideoStep {
+                Button("Play without subtitle") { playStaged(subtitle: nil) }
+                    .font(.subheadline)
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .animation(.easeInOut(duration: 0.2), value: pendingVideoURL)
+        .fileImporter(isPresented: $showFileImporter,
+                      allowedContentTypes: importPhase == .subtitle ? subtitleContentTypes : videoContentTypes,
+                      allowsMultipleSelection: false) { result in
+            switch importPhase {
+            case .video:
+                guard case .success(let urls) = result, let url = urls.first else { return }
+                if addSubtitleUpFront {
+                    // Stage: copy now (the picker's scope is transient) and move to the subtitle step.
+                    pendingVideoTitle = url.deletingPathExtension().lastPathComponent
+                    pendingVideoURL = LocalPlaybackCoordinator.shared.importVideo(from: url) ?? url
+                } else {
+                    LocalPlaybackCoordinator.shared.playPickedVideo(url, subtitle: nil)
+                }
+            case .subtitle:
+                // Cancelling leaves the user on the subtitle step (they can retry or skip).
+                guard case .success(let urls) = result, let url = urls.first else { return }
+                playStaged(subtitle: LocalPlaybackCoordinator.shared.importSubtitle(from: url))
+            }
+        }
+    }
+
+    /// Launches the staged video with an optional subtitle, then resets the staged state.
+    private func playStaged(subtitle: SubtitleTrack?) {
+        guard let video = pendingVideoURL else { return }
+        LocalPlaybackCoordinator.shared.launch(videoURL: video, subtitle: subtitle, resumeFrom: nil)
+        pendingVideoURL = nil
+        pendingVideoTitle = nil
+        pendingSubtitle = nil
+    }
+
+    /// Drops a staged (already-copied) video and reclaims its copy.
+    private func clearStagedVideo() {
+        if let url = pendingVideoURL, let name = LocalPlaybackCoordinator.shared.importName(for: url) {
+            LocalPlaybackCoordinator.shared.removeImport(name: name)
+        }
+        pendingVideoURL = nil
+        pendingVideoTitle = nil
+        pendingSubtitle = nil
+    }
+
+    private var videoContentTypes: [UTType] {
+        [.movie, .video, .mpeg4Movie, .quickTimeMovie, .data]
+    }
+
+    private var subtitleContentTypes: [UTType] {
+        var types: [UTType] = [.plainText, .text, .data]
+        if let vtt = UTType(filenameExtension: "vtt") { types.insert(vtt, at: 0) }
+        if let srt = UTType(filenameExtension: "srt") { types.insert(srt, at: 0) }
+        return types
+    }
+
+    // MARK: - Results Grid
+    private var resultsView: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, spacing: 12) {
+                if !vm.aniListResults.isEmpty {
+                    ForEach(vm.aniListResults) { media in
+                        NavigationLink {
+                            AniListDetailView(mediaId: media.id, preloadedMedia: media)
+                        } label: {
+                            AniListCardView(media: media)
+                        }
+                        .buttonStyle(CardPressStyle())
+                    }
+                } else {
+                    ForEach(vm.moduleResults) { item in
+                        NavigationLink {
+                            if moduleManager.activeModule?.isManga == true {
+                                MangaDetailView(item: item)
+                            } else {
+                                DetailView(item: item)
+                            }
+                        } label: {
+                            AnimeCardView(item: item)
+                        }
+                        .buttonStyle(CardPressStyle())
+                    }
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+            .padding(.bottom, 16)
+            .animation(.easeInOut(duration: 0.25), value: vm.resultCount)
+        }
+        .softScrollEdges()
+    }
+
+    // MARK: - Loading View
+    private var loadingView: some View {
+        VStack(spacing: 12) {
+            ProgressView()
+                .scaleEffect(1.2)
+            Text("Searching…")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - History View
+    private var historyView: some View {
+        List {
+            Section {
+                ForEach(history.queries, id: \.self) { query in
+                    Button {
+                        vm.query = query
+                        history.add(query)
+                        vm.search(usingModule: usingModule)
+                    } label: {
+                        Label(query, systemImage: "clock")
+                            .foregroundStyle(.primary)
+                    }
+                    #if !os(tvOS)
+                    .swipeActions(edge: .trailing) {
+                        Button(role: .destructive) {
+                            history.remove(query)
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                        .tint(.red)
+                    }
+                    #endif
+                }
+            } header: {
+                HStack {
+                    Text("Recent Searches")
+                    Spacer()
+                    Button("Clear All") { history.clear() }
+                        .font(.caption)
+                        .textCase(nil)
+                }
+            }
+        }
+        .softScrollEdges()
+        #if os(iOS)
+        .listStyle(.insetGrouped)
+        #elseif !os(tvOS)
+        .listStyle(.inset)
+        #endif
+    }
+
+    // MARK: - Empty State
+    private func emptyStateView(icon: String, title: String, subtitle: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: icon)
+                .font(.system(size: 52))
+                .foregroundStyle(.secondary)
+            VStack(spacing: 4) {
+                Text(title)
+                    .font(.headline)
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(40)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    // MARK: - Module Button
+    @ViewBuilder
+    private var moduleButton: some View {
+        Button {
+            showModuleList = true
+        } label: {
+            HStack(spacing: 6) {
+                // Icon container (rounded)
+                Group {
+                    if usingModule {
+                        if let iconUrlString = moduleManager.activeModule?.iconUrl, !iconUrlString.isEmpty {
+                            CachedAsyncImage(urlString: iconUrlString)
+                        } else {
+                            fallbackIcon
+                        }
+                    } else {
+                        CachedAsyncImage(urlString: primaryProvider.iconURL)
+                    }
+                }
+                .frame(width: 20, height: 20)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .background(
+                    (usingModule ? Color.secondary.opacity(0.1) : Color.primary.opacity(0.1)),
+                    in: RoundedRectangle(cornerRadius: 4)
+                )
+
+                // Text label
+                Text(usingModule ? (moduleManager.activeModule?.sourceName ?? "Module") : primaryProvider.displayName)
+                    .font(.callout)
+                    .fontWeight(.medium)
+            }
+            .foregroundStyle(.primary)
+        }
+    }
+
+    private var fallbackIcon: some View {
+        Image(systemName: "puzzlepiece.extension")
+            .font(.system(size: 14))
+            .foregroundStyle(.secondary)
+    }
+}
+
+// MARK: - Local Import Phase
+/// Which file the shared local-file importer is currently picking.
+private enum LocalImportPhase { case video, subtitle }
+
+// MARK: - Search History Manager
+private final class SearchHistoryManager: ObservableObject {
+    @Published private(set) var queries: [String] = []
+    private let key = "searchHistory"
+    private let maxItems = 20
+
+    init() {
+        queries = UserDefaults.standard.stringArray(forKey: key) ?? []
+    }
+
+    func add(_ query: String) {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        guard !q.isEmpty else { return }
+        var updated = queries.filter { $0.lowercased() != q.lowercased() }
+        updated.insert(q, at: 0)
+        queries = Array(updated.prefix(maxItems))
+        UserDefaults.standard.set(queries, forKey: key)
+    }
+
+    func remove(_ query: String) {
+        queries.removeAll { $0 == query }
+        UserDefaults.standard.set(queries, forKey: key)
+    }
+
+    func clear() {
+        queries = []
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+}
+
+// MARK: - Search Activation Observer
+private struct SearchActivationObserver: View {
+    @Environment(\.isSearching) private var isSearching
+    let onActivate: () -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onChangeOf(isSearching) { active in
+                if active { onActivate() }
+            }
+    }
+}
+
+// MARK: - Conditional Searchable
+/// Applies `.searchable` only when enabled, so the local-playback module can hide
+/// the search bar entirely instead of showing an inert field.
+private struct ConditionalSearchable: ViewModifier {
+    let enabled: Bool
+    @Binding var text: String
+    func body(content: Content) -> some View {
+        if enabled {
+            content.searchable(text: $text, prompt: "Search anime…")
+        } else {
+            content
+        }
+    }
+}
+
+// MARK: - Card Press Style
+/// Shared by the search results grid and the browse grid, which want identical press feedback.
+struct CardPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.96 : 1.0)
+            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
+    }
+}
+
+// MARK: - AniList Card
+struct AniListCardView: View {
+    let media: Media
+
+    var body: some View {
+        Color.clear
+            .aspectRatio(2/3, contentMode: .fit)
+            .overlay(
+                ZStack {
+                    TVDBPosterImage(media: media)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
+
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0.5),
+                            .init(color: .black.opacity(0.92), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            )
+            .overlay(alignment: .bottomLeading) {
+                Text(media.title.displayTitle)
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
+            }
+            .overlay(alignment: .topTrailing) {
+                if let score = media.averageScore {
+                    Label("\(score)%", systemImage: "star.fill")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(.yellow)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.black.opacity(0.55), in: Capsule())
+                        .padding(10)
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 12))
+            .shadow(color: .black.opacity(0.35), radius: 8, x: 0, y: 4)
+            .contentShape(Rectangle())
+    }
+}

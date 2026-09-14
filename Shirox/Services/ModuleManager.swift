@@ -1,0 +1,236 @@
+import Foundation
+import SwiftUI
+import Combine
+
+/// Mirror of MangaModuleResolver's preference, for the anime side: keep the active
+/// module if it's an anime (non-manga) module, else fall back to the first anime
+/// module, else nil.
+enum AnimeModulePreference {
+    static func pick(active: ModuleDefinition?, modules: [ModuleDefinition]) -> ModuleDefinition? {
+        if let active, active.isManga == false { return active }
+        return modules.first { $0.isManga == false }
+    }
+}
+
+@MainActor
+final class ModuleManager: ObservableObject {
+    static let shared = ModuleManager()
+
+    @Published var modules: [ModuleDefinition] = []
+    @Published var activeModule: ModuleDefinition?
+    @Published var moduleReadyId: String? = nil
+    @Published var isLoading = false
+    @Published var errorMessage: String?
+
+    private let storageKey = "savedModules"
+    private let activeKey = "activeModuleId"
+
+    private init() {
+        loadFromStorage()
+    }
+
+    // MARK: - Add Module
+
+    func addModule(from jsonURL: URL) async {
+        isLoading = true
+        errorMessage = nil
+        do {
+            let (data, _) = try await URLSession.shared.data(from: jsonURL)
+            var module = try JSONDecoder().decode(ModuleDefinition.self, from: data)
+            module.jsonUrl = jsonURL.absoluteString
+
+            // Cache script and icon
+            await cacheAssets(for: &module)
+
+            // Avoid duplicates
+            if modules.contains(where: { $0.id == module.id }) {
+                modules.removeAll { $0.id == module.id }
+            }
+            modules.append(module)
+            saveToStorage()
+
+            // Auto-select if it's the first module
+            if activeModule == nil {
+                selectModule(module)
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+
+    // MARK: - Remove Module
+
+    func removeModule(_ module: ModuleDefinition) {
+        modules.removeAll { $0.id == module.id }
+        if activeModule?.id == module.id {
+            activeModule = nil
+        }
+        saveToStorage()
+    }
+
+    // MARK: - Select Module
+
+    func selectModule(_ module: ModuleDefinition) {
+        activeModule = module
+        UserDefaults.standard.set(module.id, forKey: activeKey)
+        
+        Task {
+            do {
+                try await JSEngine.shared.loadModule(module)
+                moduleReadyId = module.id
+            } catch {
+                Logger.shared.log("[ModuleManager] Failed to load JS for module \(module.sourceName): \(error.localizedDescription)", type: "Error")
+            }
+        }
+    }
+
+    /// Like selectModule, but suspends until the module's JS is loaded.
+    /// Returns false when the script failed to load. Used by flows that must
+    /// call into the module immediately after switching (Continue Reading).
+    func selectAndAwaitReady(_ module: ModuleDefinition) async -> Bool {
+        activeModule = module
+        UserDefaults.standard.set(module.id, forKey: activeKey)
+        do {
+            try await JSEngine.shared.loadModule(module)
+            moduleReadyId = module.id
+            return true
+        } catch {
+            Logger.shared.log("[ModuleManager] Failed to load JS for module \(module.sourceName): \(error.localizedDescription)", type: "Error")
+            return false
+        }
+    }
+
+    // MARK: - Reorder Modules
+
+    func moveModules(from source: IndexSet, to destination: Int) {
+        modules.move(fromOffsets: source, toOffset: destination)
+        saveToStorage()
+    }
+
+    func deselectModule() {
+        activeModule = nil
+        UserDefaults.standard.removeObject(forKey: activeKey)
+    }
+
+    // MARK: - Restore Active Module on Launch
+
+    func restoreActiveModule() async {
+        if let savedId = UserDefaults.standard.string(forKey: activeKey),
+           let module = modules.first(where: { $0.id == savedId }) {
+            selectModule(module)
+            return
+        }
+        // Nothing saved (fresh install, or the saved module was removed): the
+        // embedded Anizium module makes the app work out of the box, so it
+        // becomes the active source.
+        if activeModule == nil,
+           let embedded = modules.first(where: { $0.id == AniziumEmbeddedModule.scriptURL }) {
+            selectModule(embedded)
+        }
+    }
+
+    // MARK: - Backup Restore
+
+    /// Replaces the installed module list from a backup by re-fetching each manifest.
+    /// Returns the `jsonUrl`s that could not be installed, so the import can report them.
+    ///
+    /// Re-fetching rather than restoring stored definitions keeps the backup file small:
+    /// a `ModuleDefinition` carries the module's whole script in `scriptContent` and its
+    /// icon as base64 in `iconData`.
+    func restoreModules(jsonUrls: [String], activeId: String?) async -> [String] {
+        modules = []
+        activeModule = nil
+        saveToStorage()
+
+        var failed: [String] = []
+        for urlString in jsonUrls {
+            guard let url = URL(string: urlString) else {
+                failed.append(urlString)
+                continue
+            }
+            let before = modules.count
+            await addModule(from: url)
+            if modules.count == before { failed.append(urlString) }
+        }
+
+        if let activeId, let module = modules.first(where: { $0.id == activeId }) {
+            selectModule(module)
+        }
+        return failed
+    }
+
+    // MARK: - Auto-Update
+
+    func checkForUpdates() async {
+        var didUpdate = false
+        for i in modules.indices {
+            guard let jsonUrlStr = modules[i].jsonUrl,
+                  let jsonURL = URL(string: jsonUrlStr),
+                  let (data, _) = try? await URLSession.shared.data(from: jsonURL),
+                  var fresh = try? JSONDecoder().decode(ModuleDefinition.self, from: data),
+                  fresh.version != modules[i].version else { continue }
+            fresh.jsonUrl = jsonUrlStr
+            
+            // Cache fresh assets
+            await cacheAssets(for: &fresh)
+            
+            let wasActive = activeModule?.id == modules[i].id
+            modules[i] = fresh
+            if wasActive { selectModule(fresh) }
+            didUpdate = true
+        }
+        if didUpdate { saveToStorage() }
+    }
+
+    // MARK: - Asset Caching
+
+    private func cacheAssets(for module: inout ModuleDefinition) async {
+        // 1. Script
+        if let scriptURL = URL(string: module.scriptUrl),
+           let (data, _) = try? await URLSession.shared.data(from: scriptURL),
+           let script = String(data: data, encoding: .utf8) {
+            module.scriptContent = script
+        }
+        
+        // 2. Icon
+        if let iconUrlStr = module.iconUrl,
+           let iconURL = URL(string: iconUrlStr),
+           let (data, _) = try? await URLSession.shared.data(from: iconURL) {
+            module.iconData = data.base64EncodedString()
+        }
+    }
+
+    // MARK: - Persistence
+
+    private func saveToStorage() {
+        if let data = try? JSONEncoder().encode(modules) {
+            UserDefaults.standard.set(data, forKey: storageKey)
+        }
+    }
+
+    private func loadFromStorage() {
+        if let data = UserDefaults.standard.data(forKey: storageKey),
+           let saved = try? JSONDecoder().decode([ModuleDefinition].self, from: data) {
+            modules = saved
+        }
+        ensureEmbeddedModulesPresent()
+    }
+
+    /// Keeps the embedded Anizium module installed: added on first launch, and
+    /// its cached script refreshed whenever an app update ships a newer copy.
+    /// Users stay free to remove it for the session — it quietly returns on the
+    /// next launch, since playback is built around it in this build.
+    private func ensureEmbeddedModulesPresent() {
+        guard let embedded = AniziumEmbeddedModule.makeDefinition() else { return }
+        if let index = modules.firstIndex(where: { $0.id == embedded.id }) {
+            if modules[index].scriptContent != embedded.script {
+                modules[index].scriptContent = embedded.script
+                saveToStorage()
+            }
+            return
+        }
+        modules.insert(embedded, at: 0)
+        saveToStorage()
+    }
+}

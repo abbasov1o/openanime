@@ -1,0 +1,517 @@
+import SwiftUI
+import Combine
+
+// MARK: - Continue Watching context-menu navigation
+
+/// Where a Continue Watching context-menu item wants to navigate.
+enum ContinueWatchingNavTarget {
+    case detail(ContinueWatchingItem)
+    case anilist(ContinueWatchingItem)
+}
+
+@ViewBuilder
+private func cwNavDestination(_ target: ContinueWatchingNavTarget) -> some View {
+    switch target {
+    case .detail(let item):
+        if let href = item.detailHref, let mid = item.moduleId {
+            DetailView(
+                item: SearchItem(title: item.mediaTitle, image: item.imageUrl, href: href),
+                moduleId: mid,
+                aniListID: item.aniListID
+            )
+        }
+    case .anilist(let item):
+        if let aid = item.aniListID {
+            AniListDetailView(mediaId: aid, preloadedMedia: nil)
+        }
+    }
+}
+
+extension View {
+    /// Drives Continue Watching context-menu navigation from HomeView. Attach outside the
+    /// ScrollView. Uses `navigationDestinationCompat`, which pushes via a hidden
+    /// `NavigationLink` on iOS (the app's `NavigationStack` is really a `NavigationView`,
+    /// which ignores `navigationDestination(...)`).
+    func continueWatchingNavigation(_ target: Binding<ContinueWatchingNavTarget?>) -> some View {
+        self.navigationDestinationCompat(item: target) { cwNavDestination($0) }
+    }
+}
+
+// MARK: - ContinueWatchingSection
+
+struct ContinueWatchingSection: View {
+    let items: [ContinueWatchingItem]
+    /// Owned by HomeView so the driving NavigationLink lives outside the ScrollView.
+    @Binding var navTarget: ContinueWatchingNavTarget?
+    @Environment(\.horizontalSizeClass) private var sizeClass
+
+    private var cardWidth: CGFloat {
+        sizeClass == .regular ? 260 : 210
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center) {
+                VStack(alignment: .leading, spacing: 5) {
+                    Text("Continue Watching")
+                        .font(.title2.weight(.heavy))
+                        .tracking(0.3)
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.primary)
+                        .frame(width: 36, height: 3)
+                }
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    ForEach(items) { item in
+                        itemView(for: item)
+                            .frame(width: cardWidth)
+                    }
+                }
+                .padding(.horizontal, 16)
+            }
+        }
+    }
+
+    // MARK: - Per-item interaction (mirrors AnimeSection pattern)
+
+    @ViewBuilder
+    private func itemView(for item: ContinueWatchingItem) -> some View {
+        if item.streamUrl.isEmpty, let aniListID = item.aniListID {
+            // AniList Up Next — navigate to detail to pick episode
+            NavigationLink {
+                AniListDetailView(mediaId: aniListID, preloadedMedia: nil, resumeEpisodeNumber: item.episodeNumber, resumeWatchedSeconds: item.watchedSeconds)
+            } label: {
+                ContinueWatchingCardDisplay(item: item)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { contextMenuItems(for: item) }
+        } else if item.streamUrl.isEmpty, let href = item.detailHref, let mid = item.moduleId {
+            // Module Up Next — navigate to detail, activating the correct module first
+            NavigationLink {
+                DetailView(item: SearchItem(title: item.mediaTitle, image: item.imageUrl, href: href), resumeEpisodeNumber: item.episodeNumber, resumeWatchedSeconds: item.watchedSeconds, moduleId: mid, aniListID: item.aniListID)
+            } label: {
+                ContinueWatchingCardDisplay(item: item)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { contextMenuItems(for: item) }
+        } else {
+            // In-progress item — resume directly with stored URL; PlayerView re-fetches if expired
+            Button { resume(item) } label: {
+                ContinueWatchingCardDisplay(item: item)
+            }
+            .buttonStyle(.plain)
+            .contextMenu { contextMenuItems(for: item) }
+        }
+    }
+
+    private func resume(_ item: ContinueWatchingItem) {
+        #if os(iOS)
+        // Local file: resume from our persistent copy and reload the up-front subtitle if any.
+        if let name = item.localImportName {
+            if let url = LocalPlaybackCoordinator.shared.resolveImport(name: name) {
+                let subtitle = item.localSubtitleImportName
+                    .flatMap { LocalPlaybackCoordinator.shared.resolveImport(name: $0) }
+                    .map { SubtitleTrack(title: $0.deletingPathExtension().lastPathComponent, url: $0, headers: [:]) }
+                LocalPlaybackCoordinator.shared.launch(videoURL: url, subtitle: subtitle, resumeFrom: item.watchedSeconds)
+            } else {
+                ToastManager.shared.show(message: "File moved or unavailable — remove this item", type: .error)
+            }
+            return
+        }
+        // Legacy bookmark resume for items saved before the copy-into-storage change.
+        if let data = item.bookmarkData {
+            if let url = LocalPlaybackCoordinator.shared.resolveBookmark(data) {
+                LocalPlaybackCoordinator.shared.launch(videoURL: url, subtitle: nil, resumeFrom: item.watchedSeconds)
+            } else {
+                ToastManager.shared.show(message: "File moved or unavailable — remove this item", type: .error)
+            }
+            return
+        }
+        #endif
+        guard !item.streamUrl.isEmpty, let url = URL(string: item.streamUrl) else { return }
+        Logger.shared.log("[Subtitles] CW resume: item.subtitle=\(item.subtitle ?? "nil") item.subtitleHeaders=\(item.subtitleHeaders?.count ?? -1) item.allSubtitles=\(item.allSubtitles?.count ?? -1) item.detailHref=\(item.detailHref ?? "nil") item.moduleId=\(item.moduleId ?? "nil")", type: "Debug")
+
+        // Ensure the correct module is active
+        if let mid = item.moduleId, let module = ModuleManager.shared.modules.first(where: { $0.id == mid }) {
+            ModuleManager.shared.selectModule(module)
+        }
+
+        let stream = StreamResult(
+            title: item.streamTitle ?? item.episodeTitle ?? "Episode \(item.episodeNumber)",
+            url: url,
+            headers: item.headers ?? [:],
+            subtitle: item.subtitle,
+            subtitleHeaders: item.subtitleHeaders ?? [:],
+            allSubtitles: item.allSubtitles
+        )
+
+        let context = PlayerContext(
+            mediaTitle: item.mediaTitle,
+            episodeNumber: item.episodeNumber,
+            episodeTitle: item.episodeTitle,
+            imageUrl: item.imageUrl,
+            aniListID: item.aniListID,
+            malID: item.aniListID.flatMap { IDMappingService.shared.cachedMalId(forAnilistId: $0) },
+            moduleId: item.moduleId,
+            totalEpisodes: item.totalEpisodes,
+            availableEpisodes: item.availableEpisodes,
+            isAiring: item.isAiring,
+            resumeFrom: item.watchedSeconds,
+            detailHref: item.detailHref,
+            episodeHref: item.episodeHref,
+            streamTitle: item.streamTitle,
+            workingDetailHref: item.detailHref,
+            thumbnailUrl: item.thumbnailUrl
+        )
+
+        // Setup Next Episode loader using ModuleJSRunner (if module) or JSEngine (if AniList).
+        // Anchor on the saved episode href so multi-season flat lists (numbers repeat) advance
+        // to the right season; the number-based match remains a fallback for items saved before
+        // episodeHref was recorded.
+        var currentHref = item.episodeHref
+        let onWatchNext: WatchNextLoader? = { currentEpNum in
+            Logger.shared.log("[ContinueWatching] onWatchNext called for episode \(currentEpNum)", type: "Debug")
+
+            // For module-sourced items
+            if let moduleId = item.moduleId, let module = ModuleManager.shared.modules.first(where: { $0.id == moduleId }) {
+                do {
+                    let runner = ModuleJSRunner()
+                    try await runner.load(module: module)
+
+                    // Fetch episodes via detailHref or search
+                    var episodes: [EpisodeLink] = []
+                    if let href = item.detailHref {
+                        episodes = try await runner.fetchEpisodes(url: href)
+                    } else {
+                        let results = try await runner.search(keyword: item.mediaTitle)
+                        if let match = results.first {
+                            episodes = try await runner.fetchEpisodes(url: match.href)
+                        }
+                    }
+
+                    guard !episodes.isEmpty else {
+                        return nil
+                    }
+
+                    guard let nextEp = EpisodeNavigator.next(afterHref: currentHref, orNumber: currentEpNum, in: episodes) else {
+                        return nil
+                    }
+                    let streams = try await runner.fetchStreams(episodeUrl: nextEp.href).sorted { $0.title < $1.title }
+
+                    guard !streams.isEmpty else { return nil }
+                    currentHref = nextEp.href
+                    return (streams: streams, episodeNumber: Int(nextEp.number), episodeHref: nextEp.href)
+                } catch {
+                    Logger.shared.log("[ContinueWatching] Next episode failed (module): \(error)", type: "Error")
+                    return nil
+                }
+            }
+            // For AniList-sourced items with detailHref
+            else if let href = item.detailHref {
+                do {
+                    let episodes = try await JSEngine.shared.fetchEpisodes(url: href)
+                    guard let nextEp = EpisodeNavigator.next(afterHref: currentHref, orNumber: currentEpNum, in: episodes) else {
+                        return nil
+                    }
+                    let streams = try await JSEngine.shared.fetchStreams(episodeUrl: nextEp.href).sorted { $0.title < $1.title }
+                    guard !streams.isEmpty else { return nil }
+                    currentHref = nextEp.href
+                    return (streams: streams, episodeNumber: Int(nextEp.number), episodeHref: nextEp.href)
+                } catch {
+                    Logger.shared.log("[ContinueWatching] Next episode failed (anilist): \(error)", type: "Error")
+                    return nil
+                }
+            }
+            // No way to fetch next episode
+            else {
+                return nil
+            }
+        }
+
+        // Anchor on the current episode's href (number repeats on flat multi-season lists),
+        // so a post-advance refetch resolves the episode actually on screen.
+        let onExpired: StreamRefetchLoader? = { episodeNumber, episodeHref in
+            if let moduleId = item.moduleId,
+               let module = ModuleManager.shared.modules.first(where: { $0.id == moduleId }),
+               let href = item.detailHref {
+                let runner = ModuleJSRunner()
+                try await runner.load(module: module)
+                let episodes = try await runner.fetchEpisodes(url: href)
+                guard let ep = EpisodeNavigator.resolve(href: episodeHref, orNumber: episodeNumber, in: episodes) else { return [] }
+                return try await runner.fetchStreams(episodeUrl: ep.href).sorted { $0.title < $1.title }
+            } else if let href = item.detailHref {
+                let episodes = try await JSEngine.shared.fetchEpisodes(url: href)
+                guard let ep = EpisodeNavigator.resolve(href: episodeHref, orNumber: episodeNumber, in: episodes) else { return [] }
+                return try await JSEngine.shared.fetchStreams(episodeUrl: ep.href).sorted { $0.title < $1.title }
+            }
+            return []
+        }
+
+        let storedStreams = item.allStreams?.compactMap { $0.asStreamResult } ?? []
+
+        #if os(iOS)
+        // Downloaded episodes saved a local URL: a file:// (MP4) or a 127.0.0.1 proxy URL
+        // (HLS). The HLS proxy only works while DownloadManager's server is running, which
+        // this path never starts — so replaying the stored URL fails and the onStreamExpired
+        // fallback silently re-extracts the ONLINE stream. Re-resolve through getStream() to
+        // get a fresh, server-backed local stream and drop the online fallback entirely.
+        let isLocal = url.isFileURL || url.host == "127.0.0.1" || url.host == "localhost"
+        if isLocal, let download = DownloadManager.shared.completedDownload(
+            mediaTitle: item.mediaTitle,
+            episodeNumber: item.episodeNumber,
+            aniListID: item.aniListID,
+            moduleId: item.moduleId,
+            streamTitle: item.streamTitle
+        ) {
+            Task {
+                guard let localStream = await DownloadManager.shared.getStream(for: download) else {
+                    ToastManager.shared.show(message: "Downloaded file is missing — re-download to play offline", type: .error)
+                    return
+                }
+                PlayerPresenter.shared.presentPlayer(stream: localStream, context: context, onWatchNext: onWatchNext)
+            }
+            return
+        }
+
+        PlayerPresenter.shared.presentPlayer(stream: stream, streams: storedStreams, context: context, onWatchNext: onWatchNext, onStreamExpired: onExpired)
+        #endif
+    }
+
+    @ViewBuilder
+    private func contextMenuItems(for item: ContinueWatchingItem) -> some View {
+        if let _ = item.detailHref, let mid = item.moduleId {
+            Button {
+                if let module = ModuleManager.shared.modules.first(where: { $0.id == mid }) {
+                    ModuleManager.shared.selectModule(module)
+                }
+                navTarget = .detail(item)
+            } label: {
+                Label("View Details", systemImage: "list.bullet.below.rectangle")
+            }
+        }
+        if item.aniListID != nil {
+            Button {
+                navTarget = .anilist(item)
+            } label: {
+                Label("View on AniList", systemImage: "tv")
+            }
+        }
+        Button(role: .destructive) {
+            ContinueWatchingManager.shared.remove(item)
+        } label: {
+            Label("Remove", systemImage: "xmark.circle")
+        }
+    }
+}
+
+// MARK: - Card Display (pure visual, no tap handling)
+
+struct ContinueWatchingCardDisplay: View {
+    let item: ContinueWatchingItem
+    @State private var episodeThumbnail: String?
+
+    private var progress: Double {
+        guard item.totalSeconds > 0 else { return 0 }
+        return min(item.watchedSeconds / item.totalSeconds, 1.0)
+    }
+
+    /// Builds the episode label, e.g.:
+    ///   - "Ep 3"                   — no total known
+    ///   - "Ep 3 / 24"             — completed series
+    ///   - "Ep 3 / 5 • Ongoing"    — ongoing show (availableEpisodes < totalEpisodes or total unknown)
+    private func episodeLabelText(item: ContinueWatchingItem, prefix: String?) -> String {
+        let epPart: String
+        let avail = item.availableEpisodes
+        let total = item.totalEpisodes
+
+        if let avail {
+            let isOngoing = item.isAiring ?? (total == nil || avail < total!)
+            // Clamp the shown episode number to the aired count so a caught-up card never
+            // renders an out-of-range numerator (e.g. "Ep 9 / 8").
+            let shownEp = min(item.episodeNumber, avail)
+            if isOngoing {
+                epPart = "Ep \(shownEp) / \(avail) • Ongoing"
+            } else {
+                // completed or single-season module show
+                epPart = "Ep \(shownEp) / \(avail)"
+            }
+        } else if let total {
+            epPart = "Ep \(min(item.episodeNumber, total)) / \(total)"
+        } else {
+            epPart = "Ep \(item.episodeNumber)"
+        }
+
+        if let prefix {
+            return "\(prefix) • \(epPart)"
+        }
+        return epPart
+    }
+
+    private var isWatched: Bool {
+        ContinueWatchingManager.shared.isWatched(
+            aniListID: item.aniListID,
+            moduleId: item.moduleId,
+            mediaTitle: item.mediaTitle,
+            episodeNumber: item.episodeNumber
+        )
+    }
+
+    /// A placeholder whose target episode is one past the currently-aired count on an
+    /// ongoing show — i.e. the user has watched everything available and is waiting for more.
+    private var isCaughtUp: Bool {
+        guard item.streamUrl.isEmpty, let avail = item.availableEpisodes else { return false }
+        let ongoing = item.isAiring ?? (item.totalEpisodes == nil || avail < (item.totalEpisodes ?? 0))
+        return ongoing && item.episodeNumber > avail
+    }
+
+    private var displayImageUrl: String {
+        episodeThumbnail ?? item.thumbnailUrl ?? item.imageUrl
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // Thumbnail (16:9)
+            Color.clear
+                .aspectRatio(16/9, contentMode: .fit)
+                .overlay(
+                    CachedAsyncImage(urlString: displayImageUrl)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .clipped()
+                )
+                .overlay(
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0.5),
+                            .init(color: .black.opacity(0.75), location: 1)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+                .overlay(alignment: .bottomLeading) {
+                    HStack(spacing: 4) {
+                        if !item.streamUrl.isEmpty && !isWatched {
+                            Image(systemName: "play.fill")
+                                .font(.system(size: 8, weight: .bold))
+                            Text(episodeLabelText(item: item, prefix: nil))
+                                .font(.caption2.weight(.medium))
+                        } else if isCaughtUp {
+                            Image(systemName: "checkmark.circle.fill")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(episodeLabelText(item: item, prefix: "Caught up"))
+                                .font(.caption2.weight(.bold))
+                        } else {
+                            Image(systemName: "arrow.right.circle.fill")
+                                .font(.system(size: 10, weight: .bold))
+                            Text(episodeLabelText(item: item, prefix: "Up Next"))
+                                .font(.caption2.weight(.bold))
+                        }
+                    }
+                    .foregroundStyle(.white.opacity(0.9))
+                    .padding(.horizontal, 8)
+                    .padding(.bottom, 8)
+                }
+                .overlay(alignment: .bottom) {
+                    if !item.streamUrl.isEmpty && !isWatched {
+                        GeometryReader { geo in
+                            ZStack(alignment: .leading) {
+                                Color.white.opacity(0.2)
+                                Color.primary
+                                    .frame(width: geo.size.width * progress)
+                                    .shadow(color: Color.primary.opacity(0.5), radius: 3, x: 0, y: 0)
+                            }
+                        }
+                        .frame(height: 3)
+                    }
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .shadow(color: .black.opacity(0.3), radius: 6, x: 0, y: 3)
+
+            // Title below thumbnail
+            Text(item.mediaTitle)
+                .font(.caption)
+                .fontWeight(.semibold)
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+        }
+        .task(id: item.id) {
+            // Resolve the episode-specific thumbnail via the same robust waterfall the
+            // detail episode rows use. getEpisode handles the absolute↔relative episode-number
+            // offset that module-sourced numbers need — a plain `.episode == n` match misses
+            // those and would fall through to a series poster. Only fall back to series
+            // artwork when no per-episode image exists.
+            let id: Int?
+            let provider: ProviderType
+            if let aid = item.aniListID {
+                id = aid; provider = .anilist
+            } else if let mid = item.malID {
+                id = mid; provider = .mal
+            } else {
+                id = nil; provider = .anilist
+            }
+            guard let id else { return }
+
+            if let thumb = await TVDBMappingService.shared.getEpisode(
+                for: id, episodeNumber: item.episodeNumber, provider: provider)?.thumbnail {
+                episodeThumbnail = thumb
+                return
+            }
+            let artwork = await TVDBMappingService.shared.getArtwork(for: id, provider: provider)
+            episodeThumbnail = artwork.fanart ?? artwork.poster
+        }
+    }
+}
+
+// MARK: - Card Thumbnail
+
+/// URLSession-based image loader. More reliable than AsyncImage in scrollable
+/// containers — @State survives parent re-renders and the task only runs once
+/// per URL, not re-firing on every SwiftUI update cycle.
+private struct CardThumbnail: View {
+    let urlString: String
+    #if os(iOS) || os(tvOS)
+    @State private var platformImage: UIImage?
+    private static let cache = NSCache<NSString, UIImage>()
+    #else
+    @State private var platformImage: NSImage?
+    private static let cache = NSCache<NSString, NSImage>()
+    #endif
+
+    var body: some View {
+        Group {
+            if let platformImage {
+                #if os(iOS) || os(tvOS)
+                Image(uiImage: platformImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                #else
+                Image(nsImage: platformImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                #endif
+            } else {
+                Color.gray.opacity(0.3)
+            }
+        }
+        .task(id: urlString) {
+            guard !urlString.isEmpty, let url = URL(string: urlString) else { return }
+            if let cached = Self.cache.object(forKey: urlString as NSString) {
+                platformImage = cached
+                return
+            }
+            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return }
+            #if os(iOS) || os(tvOS)
+            guard let loaded = UIImage(data: data) else { return }
+            #else
+            guard let loaded = NSImage(data: data) else { return }
+            #endif
+            Self.cache.setObject(loaded, forKey: urlString as NSString)
+            platformImage = loaded
+        }
+    }
+}
+

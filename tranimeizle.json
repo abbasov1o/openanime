@@ -1,0 +1,18 @@
+{
+    "sourceName": "TrAnimeIzle",
+    "iconUrl": "https://www.google.com/s2/favicons?domain=tranimeizle.io&sz=64",
+    "author": {
+        "name": "Ademi",
+        "url": "https://ademi.ai"
+    },
+    "version": "1.0.2",
+    "baseUrl": "https://www.tranimeizle.io",
+    "searchBaseUrl": "https://www.tranimeizle.io",
+    "scriptUrl": "https://raw.githubusercontent.com/abbasov1o/tranimeizle/main/tranimeizle.js",
+    "type": "anime/shows/movies",
+    "asyncJS": true,
+    "streamType": "hls",
+    "quality": "1080p",
+    "language": "tr",
+    "softsub": false
+}
